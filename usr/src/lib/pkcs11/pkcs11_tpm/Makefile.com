@@ -21,8 +21,31 @@
 # Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
 #
+# Copyright 2018 Jason King
+#
 LIBRARY =	pkcs11_tpm.a
 VERS =		.1
+
+SHA1_DIR =		$(SRC)/common/crypto/sha1
+SHA1_COMMON_OBJS =	sha1.o
+SHA1_COMMON_SRC =	$(SHA1_COMMON_OBJS:%.o=$(SHA1_DIR)/%.c)
+SHA1_FLAGS =		-I$(SHA1_DIR)
+
+MD5_DIR =		$(SRC)/common/crypto/md5
+MD5_COMMON_OBJS =	md5.o
+MD5_COMMON_SRC =	$(MD5_COMMON_OBJS:%.o=%(MD5_DIR)/%.c)
+MD5_FLAGS =		-I$(MD5_DIR)
+
+RSA_DIR =		$(SRC)/common/crypto/rsa
+RSA_FLAGS =		-I$(RSA_DIR)
+
+BIGNUM_DIR =		$(SRC)/common/bignum
+BIGNUM_FLAGS =		-I$(BIGNUM_DIR)
+
+PADDING_DIR =		$(SRC)/common/crypto/padding
+PADDING_FLAGS =		-I$(PADDING_DIR)
+
+SOFTCRYPTOFLAGS =	$(RSA_FLAGS) $(PADDING_FLAGS) $(BIGNUM_FLAGS)
 
 OBJECTS= api_interface.o \
 	apiutil.o \
@@ -58,6 +81,9 @@ SRCDIR= ../common
 
 SRCS=	$(OBJECTS:%.o=$(SRCDIR)/%.c)
 
+OBJECTS+= $(SHA1_COMMON_OBJS) $(MD5_COMMON_OBJS)
+SRCS+= $(SHA1_COMMON_SRC) $(MD5_COMMON_SRC)
+
 #       set signing mode
 POST_PROCESS_SO +=      ; $(ELFSIGN_CRYPTO)
 
@@ -73,8 +99,8 @@ TSSLIB=-L$(TSPILIBDIR)
 TSSLIB64=-L$(TSPILIBDIR)/$(MACH64)
 TSSINC=-I$(TSPIINCDIR)
 
-LDLIBS += $(TSSLIB) -L$(ADJUNCT_PROTO)/lib -lc -luuid -lmd -ltspi -lsunw_crypto
-CPPFLAGS += -xCC -D_POSIX_PTHREAD_SEMANTICS $(TSSINC)
+LDLIBS += $(TSSLIB) -L$(ADJUNCT_PROTO)/lib -lc -luuid -lmd -ltspi -lsoftcrypto
+CPPFLAGS += -xCC -D_POSIX_PTHREAD_SEMANTICS $(TSSINC) $(SOFTCRYPTOFLAGS)
 CPPFLAGS64 += $(CPPFLAGS)
 CSTD=        $(CSTD_GNU99)
 
@@ -98,6 +124,14 @@ lint: $$(LINTSRC)
 
 pics/%.o: $(SRCDIR)/%.c
 	$(COMPILE.c) -o $@ $<
+	$(POST_PROCESS_O)
+
+pics/%.o: $(MD5_DIR)/%.c
+	$(COMPILE.c) $(MD5_FLAGS) -o $@ $<
+	$(POST_PROCESS_O)
+
+pics/%.o: $(SHA1_DIR)/%.c
+	$(COMPILE.c) $(SHA1_FLAGS) -o $@ $<
 	$(POST_PROCESS_O)
 
 include $(SRC)/lib/Makefile.targ
