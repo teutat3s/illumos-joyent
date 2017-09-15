@@ -88,6 +88,7 @@ typedef enum {
 } mac_client_promisc_type_t;
 
 /* flags passed to mac_unicast_add() */
+
 #define	MAC_UNICAST_NODUPCHECK			0x0001
 #define	MAC_UNICAST_PRIMARY			0x0002
 #define	MAC_UNICAST_HW				0x0004

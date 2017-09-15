@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright 2015, Joyent, Inc.
+ * Copyright 2018 Joyent, Inc.
  * Copyright 2017 RackTop Systems.
  */
 
@@ -865,9 +865,12 @@ mac_unicast_update_client_flow(mac_client_impl_t *mcip)
 	mac_protect_update_mac_token(mcip);
 
 	/*
-	 * A MAC client could have one MAC address but multiple
-	 * VLANs. In that case update the flow entries corresponding
-	 * to all VLANs of the MAC client.
+	 * When there are multiple VLANs sharing the same MAC address,
+	 * each gets its own MAC client, except when running on sun4v
+	 * vsw. In that case the mci_flent_list is used to place
+	 * multiple VLAN flows on one MAC client. If we ever get rid
+	 * of vsw then this code can go, but until then we need to
+	 * update all flow entries.
 	 */
 	for (flent = mcip->mci_flent_list; flent != NULL;
 	    flent = flent->fe_client_next) {
@@ -1025,13 +1028,13 @@ mac_unicast_primary_set(mac_handle_t mh, const uint8_t *addr)
 		return (0);
 	}
 
-	if (mac_find_macaddr(mip, (uint8_t *)addr) != 0) {
+	if (mac_find_macaddr(mip, (uint8_t *)addr) != NULL) {
 		i_mac_perim_exit(mip);
 		return (EBUSY);
 	}
 
 	map = mac_find_macaddr(mip, mip->mi_addr);
-	ASSERT(map != NULL);
+	VERIFY3P(map, !=, NULL);
 
 	/*
 	 * Update the MAC address.
@@ -1040,12 +1043,12 @@ mac_unicast_primary_set(mac_handle_t mh, const uint8_t *addr)
 		mac_capab_aggr_t aggr_cap;
 
 		/*
-		 * If the mac is an aggregation, other than the unicast
+		 * If the MAC is an aggregation, other than the unicast
 		 * addresses programming, aggr must be informed about this
-		 * primary unicst address change to change its mac address
+		 * primary unicst address change to change its MAC address
 		 * policy to be user-specified.
 		 */
-		ASSERT(map->ma_type == MAC_ADDRESS_TYPE_UNICAST_CLASSIFIED);
+		ASSERT(map->ma_type == MAC_ADDRESS_TYPE_CLASSIFIED);
 		VERIFY(i_mac_capab_get(mh, MAC_CAPAB_AGGR, &aggr_cap));
 		err = aggr_cap.mca_unicst(mip->mi_driver, addr);
 		if (err == 0)
@@ -1374,7 +1377,7 @@ mac_client_open(mac_handle_t mh, mac_client_handle_t *mchp, char *name,
 		mcip->mci_state_flags |= MCIS_IS_AGGR_PORT;
 
 	if (mip->mi_state_flags & MIS_IS_AGGR)
-		mcip->mci_state_flags |= MCIS_IS_AGGR;
+		mcip->mci_state_flags |= MCIS_IS_AGGR_CLIENT;
 
 	if ((flags & MAC_OPEN_FLAGS_USE_DATALINK_NAME) != 0) {
 		datalink_id_t	linkid;
@@ -1539,7 +1542,8 @@ mac_client_close(mac_client_handle_t mch, uint16_t flags)
 }
 
 /*
- * Set the rx bypass receive callback.
+ * Set the Rx bypass receive callback and return B_TRUE. Return
+ * B_FALSE if it's not possible to enable bypass.
  */
 boolean_t
 mac_rx_bypass_set(mac_client_handle_t mch, mac_direct_rx_t rx_fn, void *arg1)
@@ -1550,11 +1554,11 @@ mac_rx_bypass_set(mac_client_handle_t mch, mac_direct_rx_t rx_fn, void *arg1)
 	ASSERT(MAC_PERIM_HELD((mac_handle_t)mip));
 
 	/*
-	 * If the mac_client is a VLAN, we should not do DLS bypass and
-	 * instead let the packets come up via mac_rx_deliver so the vlan
-	 * header can be stripped.
+	 * If the client has more than one VLAN then process packets
+	 * through DLS. This should happen only when sun4v vsw is on
+	 * the scene.
 	 */
-	if (mcip->mci_nvids > 0)
+	if (mcip->mci_nvids > 1)
 		return (B_FALSE);
 
 	/*
@@ -1608,11 +1612,11 @@ mac_rx_set(mac_client_handle_t mch, mac_rx_t rx_fn, void *arg)
 	i_mac_perim_exit(mip);
 
 	/*
-	 * If we're changing the rx function on the primary mac of a vnic,
+	 * If we're changing the Rx function on the primary mac of a vnic,
 	 * make sure any secondary macs on the vnic are updated as well.
 	 */
 	if (umip != NULL) {
-		ASSERT((umip->mi_state_flags & MIS_IS_VNIC) != 0);
+		VERIFY3U((umip->mi_state_flags & MIS_IS_VNIC), !=, 0);
 		mac_vnic_secondary_update(umip);
 	}
 }
@@ -1787,6 +1791,14 @@ mac_client_set_rings_prop(mac_client_impl_t *mcip, mac_resource_props_t *mrp,
 				}
 			/* Let check if we can give this an excl group */
 			} else if (group == defgrp) {
+				/*
+				 * If multiple clients share an
+				 * address then they must stay on the
+				 * default group.
+				 */
+				if (mac_check_macaddr_shared(mcip->mci_unicast))
+					return (0);
+
 				ngrp = 	mac_reserve_rx_group(mcip, mac_addr,
 				    B_TRUE);
 				/* Couldn't give it a group, that's fine */
@@ -1809,6 +1821,16 @@ mac_client_set_rings_prop(mac_client_impl_t *mcip, mac_resource_props_t *mrp,
 		}
 
 		if (group == defgrp && ((mrp->mrp_nrxrings > 0) || unspec)) {
+			/*
+			 * We are requesting Rx rings. Try to reserve
+			 * a non-default group.
+			 *
+			 * If multiple clients share an address then
+			 * they must stay on the default group.
+			 */
+			if (mac_check_macaddr_shared(mcip->mci_unicast))
+				return (EINVAL);
+
 			ngrp = 	mac_reserve_rx_group(mcip, mac_addr, B_TRUE);
 			if (ngrp == NULL)
 				return (ENOSPC);
@@ -2166,10 +2188,10 @@ mac_unicast_flow_create(mac_client_impl_t *mcip, uint8_t *mac_addr,
 		flent_flags = FLOW_VNIC_MAC;
 
 	/*
-	 * For the first flow we use the mac client's name - mci_name, for
-	 * subsequent ones we just create a name with the vid. This is
+	 * For the first flow we use the MAC client's name - mci_name, for
+	 * subsequent ones we just create a name with the VID. This is
 	 * so that we can add these flows to the same flow table. This is
-	 * fine as the flow name (except for the one with the mac client's
+	 * fine as the flow name (except for the one with the MAC client's
 	 * name) is not visible. When the first flow is removed, we just replace
 	 * its fdesc with another from the list, so we will still retain the
 	 * flent with the MAC client's flow name.
@@ -2326,7 +2348,8 @@ mac_client_datapath_setup(mac_client_impl_t *mcip, uint16_t vid,
 		/*
 		 * The unicast MAC address must have been added successfully.
 		 */
-		ASSERT(mcip->mci_unicast != NULL);
+		VERIFY3P(mcip->mci_unicast, !=, NULL);
+
 		/*
 		 * Push down the sub-flows that were defined on this link
 		 * hitherto. The flows are added to the active flow table
@@ -2336,17 +2359,27 @@ mac_client_datapath_setup(mac_client_impl_t *mcip, uint16_t vid,
 	} else {
 		mac_address_t *map = mcip->mci_unicast;
 
-		ASSERT(!no_unicast);
+		VERIFY3B(no_unicast, ==, B_FALSE);
 		/*
-		 * A unicast flow already exists for that MAC client,
-		 * this flow must be the same mac address but with
-		 * different VID. It has been checked by mac_addr_in_use().
+		 * A unicast flow already exists for that MAC client
+		 * so this flow must be the same MAC address but with
+		 * a different VID. It has been checked by
+		 * mac_addr_in_use().
 		 *
-		 * We will use the SRS etc. from the mci_flent. Note that
-		 * We don't need to create kstat for this as except for
-		 * the fdesc, everything will be used from in the 1st flent.
+		 * We will use the SRS etc. from the initial
+		 * mci_flent. We don't need to create a kstat for
+		 * this, as except for the fdesc, everything will be
+		 * used from the first flent.
+		 *
+		 * The only time we should see multiple flents on the
+		 * same MAC client is on the sun4v vsw. If we removed
+		 * that code we should be able to remove the entire
+		 * notion of multiple flents on a MAC client (this
+		 * doesn't affect sub/user flows because they have
+		 * their own list unrelated to mci_flent_list).
 		 */
 
+		VERIFY3U(vid, !=, VLAN_ID_NONE);
 		if (bcmp(mac_addr, map->ma_addr, map->ma_len) != 0) {
 			err = EINVAL;
 			goto bail;
@@ -2475,8 +2508,13 @@ i_mac_unicast_add(mac_client_handle_t mch, uint8_t *mac_addr, uint16_t flags,
 	boolean_t		is_vnic_primary =
 	    (flags & MAC_UNICAST_VNIC_PRIMARY);
 
-	/* when VID is non-zero, the underlying MAC can not be VNIC */
-	ASSERT(!((mip->mi_state_flags & MIS_IS_VNIC) && (vid != 0)));
+	/*
+	 * When the VID is non-zero the underlying MAC cannot be a
+	 * VNIC. I.e., dladm create-vlan cannot take a VNIC as
+	 * argument, only the primary MAC client.
+	 */
+	VERIFY(!((mip->mi_state_flags & MIS_IS_VNIC) &&
+	    (vid != VLAN_ID_NONE)));
 
 	/*
 	 * Can't unicast add if the client asked only for minimal datapath
@@ -2489,18 +2527,19 @@ i_mac_unicast_add(mac_client_handle_t mch, uint8_t *mac_addr, uint16_t flags,
 	 * Check for an attempted use of the current Port VLAN ID, if enabled.
 	 * No client may use it.
 	 */
-	if (mip->mi_pvid != 0 && vid == mip->mi_pvid)
+	if (mip->mi_pvid != VLAN_ID_NONE && vid == mip->mi_pvid)
 		return (EBUSY);
 
 	/*
 	 * Check whether it's the primary client and flag it.
 	 */
-	if (!(mcip->mci_state_flags & MCIS_IS_VNIC) && is_primary && vid == 0)
+	if (!(mcip->mci_state_flags & MCIS_IS_VNIC) && is_primary &&
+	    vid == VLAN_ID_NONE)
 		mcip->mci_flags |= MAC_CLIENT_FLAGS_PRIMARY;
 
 	/*
 	 * is_vnic_primary is true when we come here as a VLAN VNIC
-	 * which uses the primary mac client's address but with a non-zero
+	 * which uses the primary MAC client's address but with a non-zero
 	 * VID. In this case the MAC address is not specified by an upper
 	 * MAC client.
 	 */
@@ -2518,7 +2557,7 @@ i_mac_unicast_add(mac_client_handle_t mch, uint8_t *mac_addr, uint16_t flags,
 		 * doesn't attempt to free the original entry that
 		 * was allocated by the VNIC driver.
 		 */
-		ASSERT(mcip->mci_unicast != NULL);
+		VERIFY3P(mcip->mci_unicast, !=, NULL);
 
 		/* Check for VLAN flags, if present */
 		if ((flags & MAC_UNICAST_TAG_DISABLE) != 0)
@@ -2552,7 +2591,7 @@ i_mac_unicast_add(mac_client_handle_t mch, uint8_t *mac_addr, uint16_t flags,
 		/*
 		 * Create a handle for vid 0.
 		 */
-		ASSERT(vid == 0);
+		VERIFY3U(vid, ==, VLAN_ID_NONE);
 		muip = kmem_zalloc(sizeof (mac_unicast_impl_t), KM_SLEEP);
 		muip->mui_vid = vid;
 		*mah = (mac_unicast_handle_t)muip;
@@ -2572,7 +2611,9 @@ i_mac_unicast_add(mac_client_handle_t mch, uint8_t *mac_addr, uint16_t flags,
 	}
 
 	/*
-	 * If this is a VNIC/VLAN, disable softmac fast-path.
+	 * If this is a VNIC/VLAN, disable softmac fast-path. This is
+	 * only relevant to legacy devices which use softmac to
+	 * interface with GLDv3.
 	 */
 	if (mcip->mci_state_flags & MCIS_IS_VNIC) {
 		err = mac_fastpath_disable((mac_handle_t)mip);
@@ -2620,9 +2661,11 @@ i_mac_unicast_add(mac_client_handle_t mch, uint8_t *mac_addr, uint16_t flags,
 		(void) mac_client_set_resources(mch, mrp);
 	} else if (mcip->mci_state_flags & MCIS_IS_VNIC) {
 		/*
-		 * This is a primary VLAN client, we don't support
-		 * specifying rings property for this as it inherits the
-		 * rings property from its MAC.
+		 * This is a VLAN client sharing the address of the
+		 * primary MAC client; i.e., one created via dladm
+		 * create-vlan. We don't support specifying ring
+		 * properties for this type of client as it inherits
+		 * these from the primary MAC client.
 		 */
 		if (is_vnic_primary) {
 			mac_resource_props_t	*vmrp;
@@ -2681,7 +2724,7 @@ i_mac_unicast_add(mac_client_handle_t mch, uint8_t *mac_addr, uint16_t flags,
 
 	/*
 	 * Set the flags here so that if this is a passive client, we
-	 * can return  and set it when we call mac_client_datapath_setup
+	 * can return and set it when we call mac_client_datapath_setup
 	 * when this becomes the active client. If we defer to using these
 	 * flags to mac_client_datapath_setup, then for a passive client,
 	 * we'd have to store the flags somewhere (probably fe_flags)
@@ -2984,14 +3027,14 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 	i_mac_perim_enter(mip);
 	if (mcip->mci_flags & MAC_CLIENT_FLAGS_VNIC_PRIMARY) {
 		/*
-		 * Called made by the upper MAC client of a VNIC.
+		 * Call made by the upper MAC client of a VNIC.
 		 * There's nothing much to do, the unicast address will
 		 * be removed by the VNIC driver when the VNIC is deleted,
 		 * but let's ensure that all our transmit is done before
 		 * the client does a mac_client_stop lest it trigger an
 		 * assert in the driver.
 		 */
-		ASSERT(muip->mui_vid == 0);
+		VERIFY3U(muip->mui_vid, ==, VLAN_ID_NONE);
 
 		mac_tx_client_flush(mcip);
 
@@ -3023,7 +3066,7 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 		return (0);
 	}
 
-	ASSERT(muip != NULL);
+	VERIFY3P(muip, !=, NULL);
 
 	/*
 	 * We are removing a passive client, we haven't setup the datapath
@@ -3031,8 +3074,9 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 	 */
 	if ((mcip->mci_flags & MAC_CLIENT_FLAGS_PASSIVE_PRIMARY) != 0) {
 
-		ASSERT((mcip->mci_flent->fe_flags & FE_MC_NO_DATAPATH) != 0);
-		ASSERT(mcip->mci_p_unicast_list == muip);
+		VERIFY3U((mcip->mci_flent->fe_flags & FE_MC_NO_DATAPATH), !=,
+		    0);
+		VERIFY3P(mcip->mci_p_unicast_list, ==, muip);
 
 		mcip->mci_flags &= ~MAC_CLIENT_FLAGS_PASSIVE_PRIMARY;
 
@@ -3055,6 +3099,7 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 		i_mac_perim_exit(mip);
 		return (0);
 	}
+
 	/*
 	 * Remove the VID from the list of client's VIDs.
 	 */
@@ -3064,7 +3109,7 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 	} else {
 		while ((pre->mui_next != NULL) && (pre->mui_next != muip))
 			pre = pre->mui_next;
-		ASSERT(pre->mui_next == muip);
+		VERIFY3P(pre->mui_next, ==, muip);
 		rw_enter(&mcip->mci_rw_lock, RW_WRITER);
 		pre->mui_next = muip->mui_next;
 		rw_exit(&mcip->mci_rw_lock);
@@ -3081,7 +3126,7 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 		 * flows.
 		 */
 		flent = mac_client_get_flow(mcip, muip);
-		ASSERT(flent != NULL);
+		VERIFY3P(flent, !=, NULL);
 
 		/*
 		 * The first one is disappearing, need to make sure
@@ -3108,7 +3153,8 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 		}
 
 		FLOW_FINAL_REFRELE(flent);
-		ASSERT(!(mcip->mci_state_flags & MCIS_EXCLUSIVE));
+		VERIFY3U((mcip->mci_state_flags & MCIS_EXCLUSIVE), ==, 0);
+
 		/*
 		 * Enable fastpath if this is a VNIC or a VLAN.
 		 */
@@ -3122,7 +3168,8 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 	mui_vid = muip->mui_vid;
 	mac_client_datapath_teardown(mch, muip, flent);
 
-	if ((mcip->mci_flags & MAC_CLIENT_FLAGS_PRIMARY) && mui_vid == 0) {
+	if ((mcip->mci_flags & MAC_CLIENT_FLAGS_PRIMARY) &&
+	    mui_vid == VLAN_ID_NONE) {
 		mcip->mci_flags &= ~MAC_CLIENT_FLAGS_PRIMARY;
 	} else {
 		i_mac_perim_exit(mip);
@@ -3147,7 +3194,7 @@ mac_unicast_remove(mac_client_handle_t mch, mac_unicast_handle_t mah)
 		 */
 		mac_get_resources((mac_handle_t)mip, mrp);
 		(void) mac_client_set_resources(mch, mrp);
-		ASSERT(mcip->mci_p_unicast_list != NULL);
+		VERIFY3P(mcip->mci_p_unicast_list, !=, NULL);
 		muip = mcip->mci_p_unicast_list;
 		mcip->mci_p_unicast_list = NULL;
 		if (mac_client_datapath_setup(mcip, VLAN_ID_NONE,
@@ -3812,12 +3859,12 @@ mac_client_poll_enable(mac_client_handle_t mch)
 	int			i;
 
 	flent = mcip->mci_flent;
-	ASSERT(flent != NULL);
+	VERIFY3P(flent, !=, NULL);
 
 	mcip->mci_state_flags |= MCIS_CLIENT_POLL_CAPABLE;
 	for (i = 0; i < flent->fe_rx_srs_cnt; i++) {
 		mac_srs = (mac_soft_ring_set_t *)flent->fe_rx_srs[i];
-		ASSERT(mac_srs->srs_mcip == mcip);
+		VERIFY3P(mac_srs->srs_mcip, ==, mcip);
 		mac_srs_client_poll_enable(mcip, mac_srs);
 	}
 }

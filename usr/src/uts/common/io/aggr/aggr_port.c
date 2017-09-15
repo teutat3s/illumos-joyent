@@ -22,7 +22,7 @@
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  * Copyright 2012 OmniTI Computer Consulting, Inc  All rights reserved.
- * Copyright (c) 2017 Joyent, Inc.
+ * Copyright 2018 Joyent, Inc.
  */
 
 /*
@@ -691,4 +691,42 @@ aggr_port_remmac(aggr_port_t *port, const uint8_t *mac_addr)
 		(void) mac_hwgroup_remmac(port->lp_hwgh, mac_addr);
 	}
 	mac_perim_exit(pmph);
+}
+
+int
+aggr_port_addvlan(aggr_port_t *port, uint16_t vid)
+{
+	mac_perim_handle_t      pmph;
+	int                     err;
+
+	ASSERT(MAC_PERIM_HELD(port->lp_grp->lg_mh));
+	mac_perim_enter_by_mh(port->lp_mh, &pmph);
+
+	/*
+	 * This function is called only when there is an underlying HW
+	 * group.
+	 */
+	VERIFY3P(port->lp_hwgh, !=, NULL);
+	err = mac_hwgroup_addvlan(port->lp_hwgh, vid);
+	mac_perim_exit(pmph);
+	return(err);
+}
+
+int
+aggr_port_remvlan(aggr_port_t *port, uint16_t vid)
+{
+	mac_perim_handle_t      pmph;
+	int                     err;
+
+	ASSERT(MAC_PERIM_HELD(port->lp_grp->lg_mh));
+	mac_perim_enter_by_mh(port->lp_mh, &pmph);
+
+	/*
+	 * This function is called only when there is an underlying HW
+	 * group.
+	 */
+	VERIFY3P(port->lp_hwgh, !=, NULL);
+	err = mac_hwgroup_remvlan(port->lp_hwgh, vid);
+	mac_perim_exit(pmph);
+	return(err);
 }

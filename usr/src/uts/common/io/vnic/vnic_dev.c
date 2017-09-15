@@ -354,7 +354,7 @@ vnic_dev_create(datalink_id_t vnic_id, datalink_id_t linkid,
 
 	rw_enter(&vnic_lock, RW_WRITER);
 
-	/* does a VNIC with the same id already exist? */
+	/* Does a VNIC with the same id already exist? */
 	err = mod_hash_find(vnic_hash, VNIC_HASH_KEY(vnic_id),
 	    (mod_hash_val_t *)&vnic);
 	if (err == 0) {
