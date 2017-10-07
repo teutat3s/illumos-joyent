@@ -3940,6 +3940,10 @@ usr/src/lib/librcm/i386/lint.out
 usr/src/lib/librcm/i386/llib-lrcm.ln
 usr/src/lib/librdc/i386/lint.out
 usr/src/lib/librdc/i386/llib-lrdc.ln
+usr/src/lib/librefhash/amd64/lint.out
+usr/src/lib/librefhash/amd64/llib-lrefhash.ln
+usr/src/lib/librefhash/i386/lint.out
+usr/src/lib/librefhash/i386/llib-lrefhash.ln
 usr/src/lib/libreparse/amd64/lint.out
 usr/src/lib/libreparse/amd64/llib-lreparse.ln
 usr/src/lib/libreparse/i386/lint.out

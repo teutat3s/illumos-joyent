@@ -188,6 +188,7 @@ SUBDIRS +=				\
 	libraidcfg	\
 	librcm		\
 	librdc		\
+	librefhash	\
 	librename	\
 	libreparse	\
 	libresolv	\
@@ -657,6 +658,7 @@ libprtdiag:	libkstat
 libprtdiag_psr:	libprtdiag
 libraidcfg:	libdevinfo
 librdc:		libnsctl libunistat libdscfg
+librefhash:	libumem
 librestart:	libuutil libscf libpool libproject libsecdb libsysevent
 libsasl:	libgss pkcs11
 libsaveargs:	libdisasm
