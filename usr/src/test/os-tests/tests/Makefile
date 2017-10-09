@@ -15,7 +15,7 @@
 #
 
 SUBDIRS = poll secflags sigqueue spoof-ras sdevfs sockfs stress timer tmpfs \
-	file-locking pf_key
+	file-locking pf_key periodic
 
 PROGS = \
 	OS-6097
