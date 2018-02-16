@@ -34,6 +34,8 @@
  *
  * A set of MAC ports are associated with each association group.
  *
+ * rpz: I'll want to add a block comment describing multi pseudo Rx rings.
+ *
  * Aggr pseudo TX rings
  * --------------------
  * The underlying ports (NICs) in an aggregation can have TX rings. To
@@ -366,9 +368,18 @@ aggr_grp_attach_port(aggr_grp_t *grp, aggr_port_t *port)
 	aggr_grp_multicst_port(port, B_TRUE);
 
 	/*
-	 * Set port's receive callback
+	 * Make sure to set the Rx callback for any pseudo groups
+	 * which have clients.
+	 *
+	 * rpz: This assumes that the the aggr pseudo rx group and
+	 * port client indexes always line up. They should, but it
+	 * might be nicer if the pseudo group had a pointer to each
+	 * port client?
 	 */
-	mac_rx_set(port->lp_mch, aggr_recv_cb, port);
+	for (uint_t i = 0; i < grp->lg_rx_group_count; i++) {
+		if (grp->lg_rx_groups[i].arg_macaddr != NULL)
+			mac_rx_set(port->lp_mchs[i], aggr_recv_cb, port);
+	}
 
 	/*
 	 * If LACP is OFF, the port can be used to send data as soon
@@ -398,7 +409,9 @@ aggr_grp_detach_port(aggr_grp_t *grp, aggr_port_t *port)
 	if (port->lp_state != AGGR_PORT_STATE_ATTACHED)
 		return (B_FALSE);
 
-	mac_rx_clear(port->lp_mch);
+	/* Clear the Rx callback for all port clients. */
+	for (uint_t i = 0; i < 256 && port->lp_mchs[i] != NULL; i++)
+		mac_rx_clear(port->lp_mchs[i]);
 
 	aggr_grp_multicst_port(port, B_FALSE);
 
@@ -537,26 +550,31 @@ aggr_grp_add_port(aggr_grp_t *grp, datalink_id_t port_linkid, boolean_t force,
 	zoneid_t port_zoneid = ALL_ZONES;
 	int err;
 
-	/* The port must be int the same zone as the aggregation. */
+	/* The port must be in the same zone as the aggregation. */
 	if (zone_check_datalink(&port_zoneid, port_linkid) != 0)
 		port_zoneid = GLOBAL_ZONEID;
 	if (grp->lg_zoneid != port_zoneid)
 		return (EBUSY);
 
 	/*
-	 * lg_mh could be NULL when the function is called during the creation
-	 * of the aggregation.
+	 * If we are creating the aggr, then there is no MAC handle
+	 * and thus no perimeter to hold. If we are adding a port to
+	 * an existing aggr, then the perimiter of the aggr's MAC must
+	 * be held.
 	 */
 	ASSERT(grp->lg_mh == NULL || MAC_PERIM_HELD(grp->lg_mh));
 
-	/* create new port */
 	err = aggr_port_create(grp, port_linkid, force, &port);
 	if (err != 0)
 		return (err);
 
 	mac_perim_enter_by_mh(port->lp_mh, &mph);
 
-	/* add port to list of group constituent ports */
+	/*
+	 * Add the new port to the end of the list.
+	 *
+	 * rpz: Convert this to list_t?
+	 */
 	cport = &grp->lg_ports;
 	while (*cport != NULL)
 		cport = &((*cport)->lp_next);
@@ -650,8 +668,15 @@ aggr_add_pseudo_rx_ring(aggr_port_t *port,
 		ring->arr_port = NULL;
 		rx_grp->arg_ring_cnt--;
 	} else {
+		/*
+		 * This must run after the MAC is registered.
+		 */
+		ASSERT(ring->arr_rh != NULL);
 		mac_hwring_setup(hw_rh, (mac_resource_handle_t)ring,
 		    mac_find_ring(rx_grp->arg_gh, j));
+
+		mac_hwring_set_direct(hw_rh, (mac_direct_rx_t)aggr_recv_cb,
+		    (void *)port, (mac_resource_handle_t)ring);
 	}
 	return (err);
 }
@@ -684,52 +709,62 @@ aggr_rem_pseudo_rx_ring(aggr_pseudo_rx_group_t *rx_grp, mac_ring_handle_t hw_rh)
 }
 
 /*
- * This function is called to create pseudo rings over the hardware rings of
- * the underlying device. Note that there is a 1:1 mapping between the pseudo
- * RX rings of the aggr and the hardware rings of the underlying port.
+ * This function is called to create pseudo rings over the hardware
+ * rings of the underlying MAC group. There is a 1:1 mapping between
+ * the pseudo Rx rings of the aggr and the hardware rings of the
+ * underlying MAC group.
  */
 static int
 aggr_add_pseudo_rx_group(aggr_port_t *port, aggr_pseudo_rx_group_t *rx_grp)
 {
-	aggr_grp_t		*grp = port->lp_grp;
 	mac_ring_handle_t	hw_rh[MAX_RINGS_PER_GROUP];
 	aggr_unicst_addr_t	*addr, *a;
 	mac_perim_handle_t	pmph;
 	int			hw_rh_cnt, i = 0, j;
 	int			err = 0;
+	uint_t			g_idx = rx_grp->arg_index;
 
 	ASSERT(MAC_PERIM_HELD(grp->lg_mh));
 	mac_perim_enter_by_mh(port->lp_mh, &pmph);
 
 	/*
-	 * This function must be called after the aggr registers its mac
-	 * and its RX group has been initialized.
+	 * This function must be called after the aggr registers its
+	 * MAC and its pseudo Rx groups have been initialized.
 	 */
 	ASSERT(rx_grp->arg_gh != NULL);
 
 	/*
 	 * Get the list the the underlying HW rings.
 	 */
-	hw_rh_cnt = mac_hwrings_get(port->lp_mch,
-	    &port->lp_hwgh, hw_rh, MAC_RING_TYPE_RX);
+	hw_rh_cnt = mac_hwrings_get(port->lp_mchs[g_idx],
+	    &port->lp_hwghs[g_idx], hw_rh, MAC_RING_TYPE_RX);
 
-	if (port->lp_hwgh != NULL) {
+	/*
+	 * rpz: I think this is only NULL if there is no RINGS capab
+	 * for the underlying port? For now I want to VERIFY for the
+	 * sake of quicker debugging while testing.
+	 */
+	VERIFY3P(port->lp_hwghs[g_idx], !=, NULL);
+	if (port->lp_hwghs[g_idx] != NULL) {
 		/*
 		 * Quiesce the HW ring and the mac srs on the ring. Note
 		 * that the HW ring will be restarted when the pseudo ring
 		 * is started. At that time all the packets will be
 		 * directly passed up to the pseudo RX ring and handled
 		 * by mac srs created over the pseudo RX ring.
+		 *
+		 * rpz: Now that there's no port SRS I need to
+		 * reevaluate this code.
 		 */
-		mac_rx_client_quiesce(port->lp_mch);
-		mac_srs_perm_quiesce(port->lp_mch, B_TRUE);
+		mac_rx_client_quiesce(port->lp_mchs[g_idx]);
+		mac_srs_perm_quiesce(port->lp_mchs[g_idx], B_TRUE);
 	}
 
 	/*
 	 * Add all the unicast addresses to the newly added port.
 	 */
 	for (addr = rx_grp->arg_macaddr; addr != NULL; addr = addr->aua_next) {
-		if ((err = aggr_port_addmac(port, addr->aua_addr)) != 0)
+		if ((err = aggr_port_addmac(port, g_idx, addr->aua_addr)) != 0)
 			break;
 	}
 
@@ -741,12 +776,13 @@ aggr_add_pseudo_rx_group(aggr_port_t *port, aggr_pseudo_rx_group_t *rx_grp)
 			aggr_rem_pseudo_rx_ring(rx_grp, hw_rh[j]);
 
 		for (a = rx_grp->arg_macaddr; a != addr; a = a->aua_next)
-			aggr_port_remmac(port, a->aua_addr);
+			aggr_port_remmac(port, g_idx, a->aua_addr);
 
-		if (port->lp_hwgh != NULL) {
-			mac_srs_perm_quiesce(port->lp_mch, B_FALSE);
-			mac_rx_client_restart(port->lp_mch);
-			port->lp_hwgh = NULL;
+		/* rpz: There's no longer an SRS, revisit this. */
+		if (port->lp_hwghs[g_idx] != NULL) {
+			mac_srs_perm_quiesce(port->lp_mchs[g_idx], B_FALSE);
+			mac_rx_client_restart(port->lp_mchs[g_idx]);
+			port->lp_hwghs[g_idx] = NULL;
 		}
 	} else {
 		port->lp_rx_grp_added = B_TRUE;
@@ -763,12 +799,11 @@ done:
 static void
 aggr_rem_pseudo_rx_group(aggr_port_t *port, aggr_pseudo_rx_group_t *rx_grp)
 {
-	aggr_grp_t		*grp = port->lp_grp;
 	mac_ring_handle_t	hw_rh[MAX_RINGS_PER_GROUP];
 	aggr_unicst_addr_t	*addr;
-	mac_group_handle_t	hwgh;
 	mac_perim_handle_t	pmph;
 	int			hw_rh_cnt, i;
+	uint_t			g_idx = rx_grp->arg_index;
 
 	ASSERT(MAC_PERIM_HELD(grp->lg_mh));
 	mac_perim_enter_by_mh(port->lp_mh, &pmph);
@@ -777,8 +812,8 @@ aggr_rem_pseudo_rx_group(aggr_port_t *port, aggr_pseudo_rx_group_t *rx_grp)
 		goto done;
 
 	ASSERT(rx_grp->arg_gh != NULL);
-	hw_rh_cnt = mac_hwrings_get(port->lp_mch,
-	    &hwgh, hw_rh, MAC_RING_TYPE_RX);
+	hw_rh_cnt = mac_hwrings_get(port->lp_mchs[g_idx], NULL, hw_rh,
+	    MAC_RING_TYPE_RX);
 
 	/*
 	 * If hw_rh_cnt is 0, it means that the underlying port does not
@@ -788,10 +823,10 @@ aggr_rem_pseudo_rx_group(aggr_port_t *port, aggr_pseudo_rx_group_t *rx_grp)
 		aggr_rem_pseudo_rx_ring(rx_grp, hw_rh[i]);
 
 	for (addr = rx_grp->arg_macaddr; addr != NULL; addr = addr->aua_next)
-		aggr_port_remmac(port, addr->aua_addr);
+		aggr_port_remmac(port, g_idx, addr->aua_addr);
 
-	if (port->lp_hwgh != NULL) {
-		port->lp_hwgh = NULL;
+	if (port->lp_hwghs[g_idx] != NULL) {
+		port->lp_hwghs[g_idx] = NULL;
 
 		/*
 		 * First clear the permanent-quiesced flag of the RX srs then
@@ -799,8 +834,10 @@ aggr_rem_pseudo_rx_group(aggr_port_t *port, aggr_pseudo_rx_group_t *rx_grp)
 		 * the HW ring and associated SRS will soon been removed when
 		 * the port is removed from the aggr.
 		 */
-		mac_srs_perm_quiesce(port->lp_mch, B_FALSE);
-		mac_rx_client_restart(port->lp_mch);
+
+		/* rpz: We no longer have a port SRS, revisit this. */
+		mac_srs_perm_quiesce(port->lp_mchs[g_idx], B_FALSE);
+		mac_rx_client_restart(port->lp_mchs[g_idx]);
 	}
 
 	port->lp_rx_grp_added = B_FALSE;
@@ -908,8 +945,11 @@ aggr_add_pseudo_tx_group(aggr_port_t *port, aggr_pseudo_tx_group_t *tx_grp)
 	/*
 	 * Get the list the the underlying HW rings.
 	 */
-	hw_rh_cnt = mac_hwrings_get(port->lp_mch,
-	    NULL, hw_rh, MAC_RING_TYPE_TX);
+	hw_rh_cnt = mac_hwrings_get(port->lp_mchs[1], NULL, hw_rh,
+	    MAC_RING_TYPE_TX);
+
+	/* rpz: Temporary, just making sure the Tx path has HW. */
+	VERIFY3S(hw_rh_cnt, >, 0);
 
 	/*
 	 * Even if the underlying NIC does not have TX rings, we
@@ -957,7 +997,7 @@ aggr_add_pseudo_tx_group(aggr_port_t *port, aggr_pseudo_tx_group_t *tx_grp)
 		port->lp_tx_ring_cnt = 0;
 	} else {
 		port->lp_tx_grp_added = B_TRUE;
-		port->lp_tx_notify_mh = mac_client_tx_notify(port->lp_mch,
+		port->lp_tx_notify_mh = mac_client_tx_notify(port->lp_mchs[1],
 		    aggr_tx_ring_update, port);
 	}
 	mac_perim_exit(pmph);
@@ -993,7 +1033,8 @@ aggr_rem_pseudo_tx_group(aggr_port_t *port, aggr_pseudo_tx_group_t *tx_grp)
 	    (sizeof (mac_ring_handle_t *) * port->lp_tx_ring_cnt));
 
 	port->lp_tx_ring_cnt = 0;
-	(void) mac_client_tx_notify(port->lp_mch, NULL, port->lp_tx_notify_mh);
+	(void) mac_client_tx_notify(port->lp_mchs[1], NULL,
+	    port->lp_tx_notify_mh);
 	port->lp_tx_grp_added = B_FALSE;
 	aggr_grp_update_default(grp);
 done:
@@ -1034,6 +1075,14 @@ aggr_pseudo_start_ring(mac_ring_driver_t arg, uint64_t mr_gen)
 
 /*
  * Add one or more ports to an existing link aggregation group.
+ *
+ * rpz: If the new port doesn't have enough groups to support the
+ * current lg_rx_group_count then either we need to dynamically reduce
+ * the number of pseudo groups or we need to fail the operation. I
+ * lean towards the later because dynamic resizing will complicate the
+ * code more. And in terms of performance, having more MAC groups
+ * available is better than having more NICs in the aggr. Polling mode
+ * is very important for good performance.
  */
 int
 aggr_grp_add_ports(datalink_id_t linkid, uint_t nports, boolean_t force,
@@ -1046,7 +1095,7 @@ aggr_grp_add_ports(datalink_id_t linkid, uint_t nports, boolean_t force,
 	boolean_t hw_vlan;
 	mac_perim_handle_t mph, pmph;
 
-	/* get group corresponding to linkid */
+	/* Get the aggr corresponding to linkid. */
 	rw_enter(&aggr_grp_lock, RW_READER);
 	if (mod_hash_find(aggr_grp_hash, GRP_HASH_KEY(linkid),
 	    (mod_hash_val_t *)&grp) != 0) {
@@ -1056,16 +1105,15 @@ aggr_grp_add_ports(datalink_id_t linkid, uint_t nports, boolean_t force,
 	AGGR_GRP_REFHOLD(grp);
 
 	/*
-	 * Hold the perimeter so that the aggregation won't be destroyed.
+	 * Hold the perimeter so that the aggregation can't be destroyed.
 	 */
 	mac_perim_enter_by_mh(grp->lg_mh, &mph);
 	rw_exit(&aggr_grp_lock);
 
 	hw_vlan = mac_has_hw_vlan(grp->lg_ports->lp_mh);
 
-	/* add the specified ports to group */
+	/* Add the specified ports to the aggr. */
 	for (i = 0; i < nports; i++) {
-		/* add port to group */
 		if ((rc = aggr_grp_add_port(grp, ports[i].lp_linkid,
 		    force, &port)) != 0) {
 			goto bail;
@@ -1096,9 +1144,17 @@ aggr_grp_add_ports(datalink_id_t linkid, uint_t nports, boolean_t force,
 		rc = aggr_add_pseudo_tx_group(port, &grp->lg_tx_group);
 		if (rc != 0)
 			goto bail;
-		rc = aggr_add_pseudo_rx_group(port, &grp->lg_rx_group);
-		if (rc != 0)
-			goto bail;
+
+		/*
+		 * rpz: I need to add code to verify that the new
+		 * ports have at least lg_rx_group_count groups.
+		 */
+		for (i = 0; i < grp->lg_rx_group_count; i++) {
+			rc = aggr_add_pseudo_rx_group(port,
+			    &grp->lg_rx_groups[i]);
+			if (rc != 0)
+				goto bail;
+		}
 
 		mac_perim_enter_by_mh(port->lp_mh, &pmph);
 
@@ -1161,7 +1217,15 @@ bail:
 				mac_perim_exit(pmph);
 			}
 			aggr_rem_pseudo_tx_group(port, &grp->lg_tx_group);
-			aggr_rem_pseudo_rx_group(port, &grp->lg_rx_group);
+			/*
+			 * rpz: Can I always remove all of them or
+			 * should I limit this to groups that were
+			 * successfully added?
+			 */
+			for (i = 0; i < grp->lg_rx_group_count; i++) {
+				aggr_rem_pseudo_rx_group(port,
+				    &grp->lg_rx_groups[i]);
+			}
 			(void) aggr_grp_rem_port(grp, port, NULL, NULL);
 		}
 	}
@@ -1323,13 +1387,9 @@ aggr_grp_create(datalink_id_t linkid, uint32_t key, uint_t nports,
 	grp->lg_tx_blocked_rings = kmem_zalloc((sizeof (mac_ring_handle_t *) *
 	    MAX_RINGS_PER_GROUP), KM_SLEEP);
 	grp->lg_tx_blocked_cnt = 0;
-	bzero(&grp->lg_rx_group, sizeof (aggr_pseudo_rx_group_t));
+	bzero(&grp->lg_rx_groups, sizeof (aggr_pseudo_rx_group_t) * 128);
 	bzero(&grp->lg_tx_group, sizeof (aggr_pseudo_tx_group_t));
 	aggr_lacp_init_grp(grp);
-
-	grp->lg_rx_group.arg_untagged = 0;
-	list_create(&(grp->lg_rx_group.arg_vlans), sizeof (aggr_vlan_t),
-	    offsetof(aggr_vlan_t, av_link));
 
 	/* add MAC ports to group */
 	grp->lg_ports = NULL;
@@ -1365,6 +1425,43 @@ aggr_grp_create(datalink_id_t linkid, uint32_t key, uint_t nports,
 		}
 	}
 
+	for (i = 0, port = grp->lg_ports; port != NULL;
+	     i++, port = port->lp_next) {
+		uint_t num_rgroups = mac_get_num_rx_groups(port->lp_mh);
+
+		/*
+		 * Gather information about the Rx groups of the
+		 * underlying ports and use the highest common number
+		 * of groups shared amongst all ports.
+		 *
+		 * rpz: Fail hard until I deal with the no RINGS capab case.
+		 */
+		VERIFY3U(num_rgroups, >, 0);
+		if (i == 0)
+			grp->lg_rx_group_count = num_rgroups;
+		else
+			grp->lg_rx_group_count = min(grp->lg_rx_group_count,
+			    num_rgroups);
+	}
+
+	/*
+	 * rpz: For now assume we always have at least 1 group. Deal
+	 * with no RINGS capab later.
+	 */
+	VERIFY3U(grp->lg_rx_group_count, >, 0);
+
+	/*
+	 * rpz: If there are no groups (or the port doesn't support
+	 * RINGS capab), then we need to do like we did before and
+	 * create one pseudo gropu (which will use SW classify).
+	 */
+	for (i = 0; i < grp->lg_rx_group_count; i++) {
+		grp->lg_rx_groups[i].arg_index = i;
+		grp->lg_rx_groups[i].arg_untagged = 0;
+		list_create(&(grp->lg_rx_groups[i].arg_vlans),
+		    sizeof (aggr_vlan_t), offsetof(aggr_vlan_t, av_link));
+	}
+
 	/*
 	 * If no explicit MAC address was specified by the administrator,
 	 * set it to the MAC address of the first port.
@@ -1382,7 +1479,7 @@ aggr_grp_create(datalink_id_t linkid, uint32_t key, uint_t nports,
 		grp->lg_mac_addr_port = grp->lg_ports;
 	}
 
-	/* set the initial group capabilities */
+	/* Set the initial group capabilities. */
 	aggr_grp_capab_set(grp);
 
 	if ((mac = mac_alloc(MAC_VERSION)) == NULL) {
@@ -1417,14 +1514,18 @@ aggr_grp_create(datalink_id_t linkid, uint32_t key, uint_t nports,
 	 * Update the MAC address of the constituent ports.
 	 * None of the port is attached at this time, the link state of the
 	 * aggregation will not change.
+	 *
+	 * All ports take on the primary MAC address of the aggr
+	 * (lg_aggr). At this point, none of the ports are attached;
+	 * thus the link state of the aggregation will not change.
 	 */
 	link_state_changed = aggr_grp_update_ports_mac(grp);
 	ASSERT(!link_state_changed);
 
-	/* update outbound load balancing policy */
+	/* Update outbound load balancing policy. */
 	aggr_send_update_policy(grp, policy);
 
-	/* set LACP mode */
+	/* Set LACP mode. */
 	aggr_lacp_set_mode(grp, lacp_mode, lacp_timer);
 
 	/*
@@ -1432,12 +1533,18 @@ aggr_grp_create(datalink_id_t linkid, uint32_t key, uint_t nports,
 	 */
 	for (port = grp->lg_ports; port != NULL; port = port->lp_next) {
 		/*
-		 * Create the pseudo ring for each HW ring of the underlying
-		 * port. Note that this is done after the aggr registers the
-		 * mac.
+		 * Create the pseudo ring for each HW ring of the
+		 * underlying port. Note that this is done after the
+		 * aggr registers its MAC.
 		 */
-		VERIFY(aggr_add_pseudo_tx_group(port, &grp->lg_tx_group) == 0);
-		VERIFY(aggr_add_pseudo_rx_group(port, &grp->lg_rx_group) == 0);
+		VERIFY3S(aggr_add_pseudo_tx_group(port, &grp->lg_tx_group),
+		    ==, 0);
+
+		for (i = 0; i < grp->lg_rx_group_count; i++) {
+			VERIFY3S(aggr_add_pseudo_rx_group(port,
+			    &grp->lg_rx_groups[i]), ==, 0);
+		}
+
 		if (aggr_port_notify_link(grp, port))
 			link_state_changed = B_TRUE;
 
@@ -1719,7 +1826,8 @@ aggr_grp_rem_ports(datalink_id_t linkid, uint_t nports, laioc_port_t *ports)
 		 * aggr_find_tx_ring() will not return any rings
 		 * belonging to it.
 		 */
-		aggr_rem_pseudo_rx_group(port, &grp->lg_rx_group);
+		for (i = 0; i < grp->lg_rx_group_count; i++)
+			aggr_rem_pseudo_rx_group(port, &grp->lg_rx_groups[i]);
 
 		/* remove port from group */
 		rc = aggr_grp_rem_port(grp, port, &mac_addr_changed,
@@ -1824,7 +1932,8 @@ aggr_grp_delete(datalink_id_t linkid, cred_t *cred)
 		(void) aggr_grp_detach_port(grp, port);
 		mac_perim_exit(pmph);
 		aggr_rem_pseudo_tx_group(port, &grp->lg_tx_group);
-		aggr_rem_pseudo_rx_group(port, &grp->lg_rx_group);
+		for (uint_t i = 0; i < grp->lg_rx_group_count; i++)
+			aggr_rem_pseudo_rx_group(port, &grp->lg_rx_groups[i]);
 		aggr_port_delete(port);
 		port = cport;
 	}
@@ -2139,6 +2248,9 @@ bail:
 	return (0);
 }
 
+/*
+ * rpz: Test this.
+ */
 static void
 aggr_grp_port_rename(const char *new_name, void *arg)
 {
@@ -2155,7 +2267,7 @@ aggr_grp_port_rename(const char *new_name, void *arg)
 	aggr_port_t *aggr_port = aggr_grp->lg_ports;
 
 	for (i = 0; i < aggr_grp->lg_nports; i++) {
-		clnt_name = mac_client_name(aggr_port->lp_mch);
+		clnt_name = mac_client_name(aggr_port->lp_mchs[0]);
 		clnt_name_len = strlen(clnt_name);
 		str_st = clnt_name;
 		str_end = &(clnt_name[clnt_name_len]);
@@ -2210,14 +2322,10 @@ aggr_m_capab_get(void *arg, mac_capab_t cap, void *cap_data)
 
 		if (cap_rings->mr_type == MAC_RING_TYPE_RX) {
 			cap_rings->mr_group_type = MAC_GROUP_TYPE_STATIC;
-			cap_rings->mr_rnum = grp->lg_rx_group.arg_ring_cnt;
-
-			/*
-			 * An aggregation advertises only one (pseudo) RX
-			 * group, which virtualizes the main/primary group of
-			 * the underlying devices.
-			 */
-			cap_rings->mr_gnum = 1;
+			/* rpz: Assume ports with static groups, for now. */
+			cap_rings->mr_rnum = grp->lg_rx_group_count *
+			    grp->lg_rx_groups[0].arg_ring_cnt;
+			cap_rings->mr_gnum = grp->lg_rx_group_count;
 			cap_rings->mr_gaddring = NULL;
 			cap_rings->mr_gremring = NULL;
 		} else {
@@ -2256,12 +2364,9 @@ aggr_fill_group(void *arg, mac_ring_type_t rtype, const int index,
     mac_group_info_t *infop, mac_group_handle_t gh)
 {
 	aggr_grp_t *grp = arg;
-	aggr_pseudo_rx_group_t *rx_group;
-	aggr_pseudo_tx_group_t *tx_group;
 
-	ASSERT(index == 0);
 	if (rtype == MAC_RING_TYPE_RX) {
-		rx_group = &grp->lg_rx_group;
+		aggr_pseudo_rx_group_t *rx_group = &grp->lg_rx_groups[index];
 		rx_group->arg_gh = gh;
 		rx_group->arg_grp = grp;
 
@@ -2280,7 +2385,10 @@ aggr_fill_group(void *arg, mac_ring_type_t rtype, const int index,
 			infop->mgi_remvlan = NULL;
 		}
 	} else {
-		tx_group = &grp->lg_tx_group;
+		aggr_pseudo_tx_group_t *tx_group = &grp->lg_tx_group;
+
+		/* rpz: I think Tx will still be 0 only. */
+		VERIFY3S(index, ==, 0);
 		tx_group->atg_gh = gh;
 	}
 }
@@ -2296,11 +2404,11 @@ aggr_fill_ring(void *arg, mac_ring_type_t rtype, const int rg_index,
 
 	switch (rtype) {
 	case MAC_RING_TYPE_RX: {
-		aggr_pseudo_rx_group_t	*rx_group = &grp->lg_rx_group;
+		aggr_pseudo_rx_group_t	*rx_group;
 		aggr_pseudo_rx_ring_t	*rx_ring;
 		mac_intr_t		aggr_mac_intr;
 
-		ASSERT(rg_index == 0);
+		rx_group = &grp->lg_rx_groups[rg_index];
 
 		ASSERT((index >= 0) && (index < rx_group->arg_ring_cnt));
 		rx_ring = rx_group->arg_rings + index;
@@ -2379,7 +2487,8 @@ aggr_rx_poll(void *arg, int bytes_to_pickup)
 				*mpp = mp->b_next;
 				mp->b_next = NULL;
 				aggr_recv_lacp(port,
-				    (mac_resource_handle_t)rr_ring, mp);
+				    (mac_resource_handle_t)rr_ring, mp,
+				    grp->lg_promisc);
 				continue;
 			}
 		}
@@ -2404,6 +2513,7 @@ aggr_addmac(void *arg, const uint8_t *mac_addr)
 	aggr_port_t		*port, *p;
 	mac_perim_handle_t	mph;
 	int			err = 0;
+	uint_t			idx = rx_group->arg_index;
 
 	mac_perim_enter_by_mh(grp->lg_mh, &mph);
 
@@ -2430,12 +2540,12 @@ aggr_addmac(void *arg, const uint8_t *mac_addr)
 	*pprev = addr;
 
 	for (port = grp->lg_ports; port != NULL; port = port->lp_next)
-		if ((err = aggr_port_addmac(port, mac_addr)) != 0)
+		if ((err = aggr_port_addmac(port, idx, mac_addr)) != 0)
 			break;
 
 	if (err != 0) {
 		for (p = grp->lg_ports; p != port; p = p->lp_next)
-			aggr_port_remmac(p, mac_addr);
+			aggr_port_remmac(p, idx, mac_addr);
 
 		*pprev = NULL;
 		kmem_free(addr, sizeof (aggr_unicst_addr_t));
@@ -2480,7 +2590,7 @@ aggr_remmac(void *arg, const uint8_t *mac_addr)
 	}
 
 	for (port = grp->lg_ports; port != NULL; port = port->lp_next)
-		aggr_port_remmac(port, mac_addr);
+		aggr_port_remmac(port, rx_group->arg_index, mac_addr);
 
 	*pprev = addr->aua_next;
 	kmem_free(addr, sizeof (aggr_unicst_addr_t));
@@ -2521,6 +2631,7 @@ aggr_addvlan(mac_group_driver_t gdriver, uint16_t vid)
 	mac_perim_handle_t      mph;
 	int                     err = 0;
 	aggr_vlan_t             *avp = NULL;
+	uint_t			idx = rx_group->arg_index;
 
 	mac_perim_enter_by_mh(aggr->lg_mh, &mph);
 
@@ -2550,7 +2661,7 @@ aggr_addvlan(mac_group_driver_t gdriver, uint16_t vid)
 
 update_ports:
 	for (port = aggr->lg_ports; port != NULL; port = port->lp_next)
-		if ((err = aggr_port_addvlan(port, vid)) != 0)
+		if ((err = aggr_port_addvlan(port, idx, vid)) != 0)
 			break;
 
 	if (err != 0) {
@@ -2563,7 +2674,7 @@ update_ports:
 		 * context -- so just VERIFY it.
 		 */
 		for (p = aggr->lg_ports; p != port; p = p->lp_next)
-			VERIFY3S(aggr_port_remvlan(p, vid), ==, 0);
+			VERIFY3S(aggr_port_remvlan(p, idx, vid), ==, 0);
 
 		if (vid == VLAN_ID_NONE)
 			rx_group->arg_untagged--;
@@ -2594,6 +2705,7 @@ aggr_remvlan(mac_group_driver_t gdriver, uint16_t vid)
 	mac_perim_handle_t      mph;
 	int                     err = 0;
 	aggr_vlan_t             *avp = NULL;
+	uint_t			idx = rx_group->arg_index;
 
 	mac_perim_enter_by_mh(aggr->lg_mh, &mph);
 
@@ -2623,7 +2735,7 @@ aggr_remvlan(mac_group_driver_t gdriver, uint16_t vid)
 
 update_ports:
 	for (port = aggr->lg_ports; port != NULL; port = port->lp_next)
-		if ((err = aggr_port_remvlan(port, vid)) != 0)
+		if ((err = aggr_port_remvlan(port, idx, vid)) != 0)
 			break;
 
 	/*
@@ -2632,7 +2744,7 @@ update_ports:
 	 */
 	if (err != 0) {
 		for (p = aggr->lg_ports; p != port; p = p->lp_next)
-			VERIFY3S(aggr_port_addvlan(p, vid), ==, 0);
+			VERIFY3S(aggr_port_addvlan(p, idx, vid), ==, 0);
 
 		if (vid == VLAN_ID_NONE)
 			rx_group->arg_untagged++;
@@ -2912,16 +3024,121 @@ aggr_set_port_sdu(aggr_grp_t *grp, aggr_port_t *port, uint32_t sdu,
 	mac_diag_t		diag;
 	int			err, rv, retry = 0;
 
-	if (port->lp_mah != NULL) {
-		(void) mac_unicast_remove(port->lp_mch, port->lp_mah);
-		port->lp_mah = NULL;
+	/*
+	 * rpz: Remove all clients so that mac_stop() doesn't blow up.
+	 */
+	for (uint_t i = 0; i < 256 && port->lp_mchs[i] != NULL; i++) {
+		if (port->lp_mchs[i] != port->lp_primary_mch) {
+			mac_client_close(port->lp_mchs[i],
+			    MAC_CLOSE_FLAGS_EXCLUSIVE |
+			    MAC_CLOSE_FLAGS_RESERVE_RX_GRP);
+			port->lp_mchs[i] = NULL;
+		}
+	}
+
+	/*
+	 * rpz: Is just removing the primary enough?
+	 */
+	if (port->lp_primary_mah != NULL) {
+		(void) mac_unicast_remove(port->lp_primary_mch,
+		    port->lp_primary_mah);
+		/*
+		 * rpz: Don't pass MAC_CLOSE_FLAGS_RESERVE_RX_GRP as
+		 * the unicast remove already remove the client from
+		 * the group.
+		 */
+		mac_client_close(port->lp_primary_mch,
+		    MAC_CLOSE_FLAGS_EXCLUSIVE);
+		port->lp_primary_mch = NULL;
+		port->lp_primary_mah = NULL;
+		port->lp_mchs[1] = NULL;
 		removed = B_TRUE;
 	}
+
 	err = mac_set_mtu(port->lp_mh, sdu, old_mtu);
+
+	/*
+	 * Now we have to reopen all the port clients. This is copied
+	 * from aggr_port_create().
+	 */
+	if (err == 0) {
+		char client_name[MAXNAMELEN];
+		char aggr_name[MAXNAMELEN];
+		char port_name[MAXNAMELEN];
+		mac_client_handle_t mch;
+
+		VERIFY3S(dls_mgmt_get_linkinfo(grp->lg_linkid, aggr_name,
+			NULL, NULL, NULL), ==, 0);
+		VERIFY3S(dls_mgmt_get_linkinfo(port->lp_linkid, port_name,
+			NULL, NULL, NULL), ==, 0);
+
+		for (uint_t i = 1; i < port->lp_num_clients; i++) {
+			uint_t grp_index;
+
+			(void) snprintf(client_name, MAXNAMELEN,
+			    "%s-%s-%u", aggr_name, port_name, i);
+
+			err = mac_client_open(port->lp_mh, &mch, client_name,
+			    MAC_OPEN_FLAGS_IS_AGGR_PORT |
+			    MAC_OPEN_FLAGS_EXCLUSIVE |
+			    MAC_OPEN_FLAGS_RESERVE_RX_GRP);
+
+			VERIFY3S(err, ==, 0);
+
+			/*
+			 * rpz: If we arrange these after
+			 * mac_hwrings_get() then we'd have a
+			 * mac_group_handle_t to use instead of using
+			 * the client handle.
+			 *
+			 * rpz: I'm not sure I really need to pull the
+			 * HW group index. Perhaps I can rely on
+			 * knowing how the Rx group is reserved to
+			 * match the client name with its group index.
+			 */
+			grp_index = mac_hwgroup_get_index(mch);
+			port->lp_mchs[grp_index] = mch;
+		}
+
+		/*
+		 * Now that all the reserved groups are taken we can
+		 * create the client on the default group.
+		 *
+		 * rpz: If passing the MAC_OPEN_FLAGS_RESERVE_RX_GRP I
+		 * could modify the reservation logic to hand out the
+		 * default group first. With that change I could avoid
+		 * this extra case and start the above for-loop at
+		 * index 0.
+		 */
+		(void) snprintf(client_name, MAXNAMELEN, "%s-%s-%u", aggr_name,
+		    port_name, 0);
+
+		err = mac_client_open(port->lp_mh, &mch, client_name,
+		    MAC_OPEN_FLAGS_IS_AGGR_PORT | MAC_OPEN_FLAGS_EXCLUSIVE |
+		    MAC_OPEN_FLAGS_RESERVE_RX_GRP);
+
+		VERIFY3S(err, ==, 0);
+		VERIFY3U(mac_hwgroup_get_index(mch), ==, 0);
+		port->lp_mchs[0] = mch;
+
+		/*
+		 * rpz: I should really be checking the aggr to see
+		 * where the primary client is currently placed (the
+		 * aggr should have a pointer to the pseudo group the
+		 * primary client is on). If we are adding this port
+		 * after initial aggr creation then the primary may
+		 * have already moved from reserved to default group.
+		 */
+		if (port->lp_num_clients == 1)
+			port->lp_primary_mch = port->lp_mchs[0];
+		else
+			port->lp_primary_mch = port->lp_mchs[1];
+	}
+
 try_again:
-	if (removed && (rv = mac_unicast_add(port->lp_mch, NULL,
+	if (removed && (rv = mac_unicast_add(port->lp_primary_mch, NULL,
 	    MAC_UNICAST_PRIMARY | MAC_UNICAST_DISABLE_TX_VID_CHECK,
-	    &port->lp_mah, 0, &diag)) != 0) {
+	    &port->lp_primary_mah, 0, &diag)) != 0) {
 		/*
 		 * following is a workaround for a bug in 'bge' driver.
 		 * See CR 6794654 for more information and this work around
@@ -2940,7 +3157,7 @@ try_again:
 		mac_perim_exit(mph);
 		cmn_err(CE_WARN, "Unable to restart the port %s while "
 		    "setting MTU. Detaching the port from the aggregation.",
-		    mac_client_name(port->lp_mch));
+		    mac_client_name(port->lp_primary_mch));
 	}
 	return (err);
 }

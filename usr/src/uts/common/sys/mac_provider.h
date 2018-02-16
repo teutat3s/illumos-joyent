@@ -355,6 +355,8 @@ typedef	mblk_t	*(*mac_ring_poll_t)(void *, int);
 
 typedef int	(*mac_ring_stat_t)(mac_ring_driver_t, uint_t, uint64_t *);
 
+typedef void	(*mac_ring_hw_setup_t)(mac_ring_driver_t);
+
 typedef struct mac_ring_info_s {
 	mac_ring_driver_t	mri_driver;
 	mac_ring_start_t	mri_start;
@@ -365,6 +367,7 @@ typedef struct mac_ring_info_s {
 		mac_ring_poll_t	poll;
 	} mrfunion;
 	mac_ring_stat_t		mri_stat;
+
 	/*
 	 * mri_flags will have some bits set to indicate some special
 	 * property/feature of a ring like serialization needed for a

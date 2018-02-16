@@ -76,6 +76,7 @@ struct mac_mtu_req_s {
 	uint32_t		mtr_mtu;
 };
 
+/* rpz: This type is unused. */
 /* Generic linked chain type */
 typedef	struct mac_chain_s {
 	struct mac_chain_s	*next;
@@ -208,9 +209,31 @@ struct mac_ring_s {
 	mac_ring_t		*mr_next;	/* next ring in the chain */
 	mac_group_handle_t	mr_gh;		/* reference to group */
 
+	/*
+	 * rpz: We need a method to bypass the SRS for aggrs.
+	 * Basically, an aggr is a MAC and its pseudo rings are rings.
+	 * There shouldn't, and can't, be an SRS between the aggr port
+	 * and the aggr's recv cb. We could create some dummy SRS but
+	 * that just muddies the waters. Instead, the mac_rx_common()
+	 * logic should detect when there is an aggr involved and hand
+	 * the data straight to its pseudo ring. Perhaps I can check
+	 * mr_prh and then hang the cb data off of that?
+	 */
 	mac_classify_type_t	mr_classify_type;	/* HW vs SW */
 	struct mac_soft_ring_set_s *mr_srs;	/* associated SRS */
-	mac_ring_handle_t	mr_prh;		/* associated pseudo ring hdl */
+
+	/*
+	 * rpz: The mr_prh is the mac_ring_t of the aggr_pseudo_ring_t.
+	 */
+	mac_ring_handle_t	mr_prh;	/* associated pseudo ring hdl */
+
+	/*
+	 * Direct pseudo ring callbacks.
+	 */
+	mac_direct_rx_t		mr_pr_func;
+	void			*mr_pr_arg1;
+	mac_resource_handle_t	mr_pr_arg2;
+
 	uint_t			mr_refcnt;	/* Ring references */
 	/* ring generation no. to guard against drivers using stale rings */
 	uint64_t		mr_gen_num;

@@ -1436,6 +1436,27 @@ mac_client_open(mac_handle_t mh, mac_client_handle_t *mchp, char *name,
 	mcip->mci_flent = flent;
 	FLOW_MARK(flent, FE_MC_NO_DATAPATH);
 	flent->fe_mcip = mcip;
+
+	if ((flags & MAC_OPEN_FLAGS_RESERVE_RX_GRP) != 0) {
+		mac_client_impl_t	*unused;
+		mac_group_state_t	next_state;
+		mac_group_t		*rgroup;
+		mac_group_t		*def_rgroup;
+
+		mcip->mci_state_flags |= MCIS_RX_GRP_PRE_RESERVE;
+		def_rgroup = MAC_DEFAULT_RX_GROUP(mip);
+		rgroup = mac_reserve_rx_group(mcip, NULL, B_FALSE);
+
+		if (rgroup == NULL)
+			rgroup = def_rgroup;
+
+		flent->fe_rx_ring_group = rgroup;
+		mac_group_add_client(rgroup, mcip);
+		next_state = mac_group_next_state(rgroup, &unused, def_rgroup,
+		    B_TRUE);
+		mac_set_group_state(rgroup, next_state);
+	}
+
 	/*
 	 * Place initial creation reference on the flow. This reference
 	 * is released in the corresponding delete action viz.
@@ -1508,6 +1529,24 @@ mac_client_close(mac_client_handle_t mch, uint16_t flags)
 		return;
 	}
 
+	flent = mcip->mci_flent;
+
+	if ((flags & MAC_CLOSE_FLAGS_RESERVE_RX_GRP) != 0) {
+		mac_client_impl_t	*unused;
+		mac_group_state_t	next_state;
+		mac_group_t		*rgroup;
+		mac_group_t		*def_rgroup;
+
+		mcip->mci_state_flags &= ~MCIS_RX_GRP_PRE_RESERVE;
+		rgroup = flent->fe_rx_ring_group;
+		def_rgroup = MAC_DEFAULT_RX_GROUP(mip);
+
+		mac_group_remove_client(rgroup, mcip);
+		next_state = mac_group_next_state(rgroup, &unused, def_rgroup,
+		    B_TRUE);
+		mac_set_group_state(rgroup, next_state);
+	}
+
 	/* If we have only setup up minimal datapth setup, tear it down */
 	if (mcip->mci_state_flags & MCIS_NO_UNICAST_ADDR) {
 		mac_client_datapath_teardown((mac_client_handle_t)mcip, NULL,
@@ -1518,7 +1557,6 @@ mac_client_close(mac_client_handle_t mch, uint16_t flags)
 	/*
 	 * Remove the flent associated with the MAC client
 	 */
-	flent = mcip->mci_flent;
 	mcip->mci_flent = NULL;
 	FLOW_FINAL_REFRELE(flent);
 
@@ -2345,6 +2383,7 @@ mac_client_datapath_setup(mac_client_impl_t *mcip, uint16_t vid,
 
 		if (no_unicast)
 			goto done_setup;
+
 		/*
 		 * The unicast MAC address must have been added successfully.
 		 */
@@ -2439,7 +2478,14 @@ done_setup:
 	if (flent->fe_rx_ring_group != NULL)
 		mac_rx_group_unmark(flent->fe_rx_ring_group, MR_INCIPIENT);
 	FLOW_UNMARK(flent, FE_INCIPIENT);
-	FLOW_UNMARK(flent, FE_MC_NO_DATAPATH);
+
+	/*
+	 * rpz: Aggr ports should never receive traffic; bad things
+	 * happen if they do.
+	 */
+	if ((mcip->mci_state_flags & MCIS_IS_AGGR_PORT) == 0)
+		FLOW_UNMARK(flent, FE_MC_NO_DATAPATH);
+
 	mac_tx_client_unblock(mcip);
 	return (0);
 bail:

@@ -1988,8 +1988,6 @@ no_softrings:
 }
 
 /*
- * mac_fanout_setup:
- *
  * Calls mac_srs_fanout_init() or modify() depending upon whether
  * the SRS is getting initialized or re-initialized.
  */
@@ -2002,14 +2000,14 @@ mac_fanout_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 	int i, rx_srs_cnt;
 
 	ASSERT(MAC_PERIM_HELD((mac_handle_t)mcip->mci_mip));
-	/*
-	 * This is an aggregation port. Fanout will be setup
-	 * over the aggregation itself.
-	 */
-	if (mcip->mci_state_flags & MCIS_EXCLUSIVE)
-		return;
 
+	/*
+	 * Aggr ports do not have SRSes. This function should never be
+	 * called on an aggr port.
+	 */
+	VERIFY3U((mcip->mci_state_flags & MCIS_IS_AGGR_PORT), ==, 0);
 	mac_rx_srs = flent->fe_rx_srs[0];
+
 	/*
 	 * Set up the fanout on the tx side only once, with the
 	 * first rx SRS. The CPU binding, fanout, and bandwidth
@@ -2065,7 +2063,7 @@ mac_fanout_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 }
 
 /*
- * mac_srs_create:
+ * rpz: Fix this comment.
  *
  * Create a mac_soft_ring_set_t (SRS). If soft_ring_fanout_type is
  * SRST_TX, an SRS for Tx side is created. Otherwise an SRS for Rx side
@@ -2401,6 +2399,11 @@ mac_rx_srs_group_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 	mac_group_t		*rx_group = flent->fe_rx_ring_group;
 	boolean_t		no_unicast;
 
+	/*
+	 * Aggr ports should never have SRSes.
+	 */
+	VERIFY3U((mcip->mci_state_flags & MCIS_IS_AGGR_PORT), ==, 0);
+
 	fanout_type = mac_find_fanout(flent, link_type);
 	no_unicast = (mcip->mci_state_flags & MCIS_NO_UNICAST_ADDR) != 0;
 
@@ -2489,38 +2492,16 @@ void
 mac_tx_srs_group_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
     uint32_t link_type)
 {
-	int			cnt;
-	int			ringcnt;
-	mac_ring_t		*ring;
-	mac_group_t		*grp;
-
 	/*
-	 * If we are opened exclusively (like aggr does for aggr_ports),
-	 * don't set up Tx SRS and Tx soft rings as they won't be used.
-	 * The same thing has to be done for Rx side also. See bug:
-	 * 6880080
+	 * Aggr ports should never have SRSes.
 	 */
-	if (mcip->mci_state_flags & MCIS_EXCLUSIVE) {
-		/*
-		 * If we have rings, start them here.
-		 */
-		if (flent->fe_tx_ring_group == NULL)
-			return;
-		grp = (mac_group_t *)flent->fe_tx_ring_group;
-		ringcnt = grp->mrg_cur_count;
-		ring = grp->mrg_rings;
-		for (cnt = 0; cnt < ringcnt; cnt++) {
-			if (ring->mr_state != MR_INUSE) {
-				(void) mac_start_ring(ring);
-			}
-			ring = ring->mr_next;
-		}
-		return;
-	}
+	VERIFY3U((mcip->mci_state_flags & MCIS_IS_AGGR_PORT), ==, 0);
+
 	if (flent->fe_tx_srs == NULL) {
 		(void) mac_srs_create(mcip, flent, SRST_TX | link_type,
 		    NULL, mcip, NULL, NULL);
 	}
+
 	mac_tx_srs_setup(mcip, flent);
 }
 
@@ -2936,12 +2917,20 @@ mac_datapath_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 		}
 
 		/*
-		 * Check to see if we can get an exclusive group for
-		 * this mac address or if there already exists a
-		 * group that has this mac address (case of VLANs).
-		 * If no groups are available, use the default group.
+		 * We may already have a group assigned in the case of
+		 * aggr (see MAC_OPEN_FLAGS_RESERVE_RX_GRP). If not,
+		 * see if we can get an exclusive group for this MAC
+		 * address or if there already exists a group for this
+		 * MAC address (case of VLANs). If no groups are
+		 * available, use the default group.
 		 */
-		rgroup = mac_reserve_rx_group(mcip, mac_addr, B_FALSE);
+		if (flent->fe_rx_ring_group != NULL) {
+			rgroup = flent->fe_rx_ring_group;
+			goto rx_grp_found;
+		} else {
+			rgroup = mac_reserve_rx_group(mcip, mac_addr, B_FALSE);
+		}
+
 		if (rgroup == NULL && rxhw) {
 			err = ENOSPC;
 			goto setup_failed;
@@ -2968,6 +2957,7 @@ mac_datapath_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 			rgroup = default_rgroup;
 		}
 
+	rx_grp_found:
 		/*
 		 * Check to see if we can get an exclusive group for
 		 * this mac client. If no groups are available, use
@@ -2988,7 +2978,15 @@ mac_datapath_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 		 * even be a default group.
 		 */
 	grp_found:
-		if (rgroup != NULL) {
+		/*
+		 * If the flow's Rx group is already set then the
+		 * client pre-reserved the group and already updated
+		 * the group's state.
+		 *
+		 * rpz: Use the client mci_state_flags to check for
+		 * this condition.
+		 */
+		if (rgroup != NULL && flent->fe_rx_ring_group == NULL) {
 			if (rgroup != default_rgroup &&
 			    MAC_GROUP_NO_CLIENT(rgroup) &&
 			    (rxhw || mcip->mci_share != NULL)) {
@@ -3062,8 +3060,11 @@ mac_datapath_setup(mac_client_impl_t *mcip, flow_entry_t *flent,
 		 * the required SRSes for the HW rings. If we have a
 		 * shared group, mac_srs_group_setup() dismantles the
 		 * HW SRSes of the previously exclusive group.
+		 *
+		 * Aggr doesn't use SRSes at the port level.
 		 */
-		mac_srs_group_setup(mcip, flent, link_type);
+		if ((mcip->mci_state_flags & MCIS_IS_AGGR_PORT) == 0)
+			mac_srs_group_setup(mcip, flent, link_type);
 
 		/* (Re)init the v6 token & local addr used by link protection */
 		mac_protect_update_mac_token(mcip);
@@ -3187,12 +3188,13 @@ mac_datapath_teardown(mac_client_impl_t *mcip, flow_entry_t *flent,
 		mac_flow_remove(mip->mi_flow_tab, flent, B_FALSE);
 		mac_flow_wait(flent, FLOW_DRIVER_UPCALL);
 
-		/* Now quiesce and destroy all SRS and soft rings */
-		mac_rx_srs_group_teardown(flent, B_FALSE);
-		mac_tx_srs_group_teardown(mcip, flent, SRST_LINK);
+		/* Quiesce and destroy all the SRSes. */
+		if ((mcip->mci_state_flags & MCIS_IS_AGGR_PORT) == 0) {
+			mac_rx_srs_group_teardown(flent, B_FALSE);
+			mac_tx_srs_group_teardown(mcip, flent, SRST_LINK);
+		}
 
-		ASSERT((mcip->mci_flent == flent) &&
-		    (flent->fe_next == NULL));
+		ASSERT((mcip->mci_flent == flent) && (flent->fe_next == NULL));
 
 		/*
 		 * Release our hold on the group as well. We need
@@ -3897,6 +3899,7 @@ mac_tx_srs_setup(mac_client_impl_t *mcip, flow_entry_t *flent)
 	boolean_t		is_aggr;
 	uint_t			ring_info = 0;
 
+	/* rpz: deal with this. */
 	is_aggr = (mcip->mci_state_flags & MCIS_IS_AGGR_CLIENT) != 0;
 	grp = flent->fe_tx_ring_group;
 	if (grp == NULL) {
@@ -4041,8 +4044,10 @@ mac_fanout_recompute_client(mac_client_impl_t *mcip, cpupart_t *cpupart)
 }
 
 /*
- * Walk through the list of mac clients for the MAC.
- * For each active mac client, recompute the number of soft rings
+ * rpz: Improve this comment.
+ *
+ * Walk through the list of MAC clients for the MAC.
+ * For each active MAC client, recompute the number of soft rings
  * associated with every client, only if current speed is different
  * from the speed that was previously used for soft ring computation.
  * If the cable is disconnected whlie the NIC is started, we would get
@@ -4065,6 +4070,11 @@ mac_fanout_recompute(mac_impl_t *mip)
 
 	for (mcip = mip->mi_clients_list; mcip != NULL;
 	    mcip = mcip->mci_client_next) {
+		/* rpz: Should I create an MIS_IS_AGGR_PORT? */
+		/* Aggr port clients don't have SRSes. */
+		if ((mcip->mci_state_flags & MCIS_IS_AGGR_PORT) != 0)
+			continue;
+
 		if ((mcip->mci_state_flags & MCIS_SHARE_BOUND) != 0 ||
 		    !MCIP_DATAPATH_SETUP(mcip))
 			continue;
@@ -4077,6 +4087,7 @@ mac_fanout_recompute(mac_impl_t *mip)
 		mac_set_pool_effective(use_default, cpupart, mrp, emrp);
 		pool_unlock();
 	}
+
 	i_mac_perim_exit(mip);
 }
 

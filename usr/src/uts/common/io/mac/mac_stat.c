@@ -1004,6 +1004,7 @@ void
 mac_ring_stat_create(mac_ring_t *ring)
 {
 	mac_impl_t	*mip = ring->mr_mip;
+	mac_group_t	*grp = (mac_group_t *)ring->mr_gh;
 	char		statname[MAXNAMELEN];
 	char		modname[MAXNAMELEN];
 
@@ -1015,8 +1016,12 @@ mac_ring_stat_create(mac_ring_t *ring)
 
 	switch (ring->mr_type) {
 	case MAC_RING_TYPE_RX:
-		(void) snprintf(statname, sizeof (statname), "mac_rx_ring%d",
-		    ring->mr_index);
+		/*
+		 * rpz: Hack for now to avoid naming collision on
+		 * multi-group aggrs.
+		 */
+		(void) snprintf(statname, sizeof (statname), "mac_rx_ring%d_%d",
+		    grp->mrg_index, ring->mr_index);
 		i_mac_rx_ring_stat_create(ring, modname, statname);
 		break;
 

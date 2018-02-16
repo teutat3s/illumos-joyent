@@ -78,9 +78,18 @@ typedef struct aggr_pseudo_rx_ring_s {
 	uint64_t		arr_gen;
 } aggr_pseudo_rx_ring_t;
 
+/*
+ * An aggr pseudo group abstracts the underlying ports' HW groups. For
+ * example, if each port has 8 groups (mac_group_t), then the aggr
+ * will create 8 psuedo groups. Each pseudo group represents a
+ * collection of HW groups: one group from each port. If you have
+ * three ports then the pseudo group stands in for three HW groups.
+ */
 typedef struct aggr_pseudo_rx_group_s {
+	uint_t			arg_index;
 	struct aggr_grp_s	*arg_grp; /* filled in by aggr_fill_group() */
 	mac_group_handle_t	arg_gh;   /* filled in by aggr_fill_group() */
+	/* rpz: Use list_t. */
 	aggr_unicst_addr_t	*arg_macaddr;
 	aggr_pseudo_rx_ring_t	arg_rings[MAX_RINGS_PER_GROUP];
 	uint_t			arg_ring_cnt;
@@ -124,7 +133,13 @@ typedef struct aggr_port_s {
 			lp_closing : 1,
 			lp_pad_bits : 24;
 	mac_handle_t	lp_mh;
-	mac_client_handle_t lp_mch;
+
+	/*
+	 * rpz: Can we use list_t?
+	 */
+	uint_t			lp_num_clients;
+	mac_client_handle_t	lp_mchs[256];
+
 	const mac_info_t *lp_mip;
 	mac_notify_handle_t lp_mnh;
 	uint_t		lp_tx_idx;		/* idx in group's tx array */
@@ -137,12 +152,22 @@ typedef struct aggr_port_s {
 	lacp_stats_t	lp_lacp_stats;
 	uint32_t	lp_margin;
 	mac_promisc_handle_t lp_mphp;
-	mac_unicast_handle_t lp_mah;
+
+	mac_client_handle_t	lp_primary_mch;
+	mac_unicast_handle_t	lp_primary_mah;
 
 	/* List of non-primary addresses that requires promiscous mode set */
 	aggr_unicst_addr_t	*lp_prom_addr;
-	/* handle of the underlying HW RX group */
-	mac_group_handle_t	lp_hwgh;
+
+	/*
+	 * rpz: I wonder if it makes more sense to keep the HW group
+	 * handle int he pseudo group? I.e., each pseudo group would
+	 * have a list_t of HW GHs with one for each port.
+	 *
+	 * rpz: Can I use list_t instead?
+	 */
+	mac_group_handle_t	lp_hwghs[256];
+
 	int			lp_tx_ring_cnt;
 	/* handles of the underlying HW TX rings */
 	mac_ring_handle_t	*lp_tx_rings;
@@ -189,7 +214,7 @@ typedef struct aggr_grp_s {
 			lg_lso : 1,
 			lg_pad_bits : 8;
 	aggr_port_t	*lg_ports;		/* list of configured ports */
-	aggr_port_t	*lg_mac_addr_port;
+	aggr_port_t	*lg_mac_addr_port;	/* using address of this port */
 	mac_handle_t	lg_mh;
 	zoneid_t	lg_zoneid;
 	uint_t		lg_nattached_ports;
@@ -233,7 +258,12 @@ typedef struct aggr_grp_s {
 	kthread_t	*lg_lacp_rx_thread;
 	boolean_t	lg_lacp_done;
 
-	aggr_pseudo_rx_group_t	lg_rx_group;
+	/*
+	 * rpz: Switch to using list_t.
+	 */
+	uint_t			lg_rx_group_count;
+	aggr_pseudo_rx_group_t	lg_rx_groups[128];
+
 	aggr_pseudo_tx_group_t	lg_tx_group;
 
 	kmutex_t	lg_tx_flowctl_lock;
@@ -351,17 +381,18 @@ extern void aggr_lacp_port_detached(aggr_port_t *);
 extern void aggr_port_lacp_set_mode(aggr_grp_t *, aggr_port_t *);
 
 extern void aggr_lacp_rx_thread(void *);
-extern void aggr_recv_lacp(aggr_port_t *, mac_resource_handle_t, mblk_t *);
+extern void aggr_recv_lacp(aggr_port_t *, mac_resource_handle_t, mblk_t *,
+    boolean_t);
 
 extern void aggr_grp_port_hold(aggr_port_t *);
 extern void aggr_grp_port_rele(aggr_port_t *);
 extern void aggr_grp_port_wait(aggr_grp_t *);
 
-extern int aggr_port_addmac(aggr_port_t *, const uint8_t *);
-extern void aggr_port_remmac(aggr_port_t *, const uint8_t *);
+extern int aggr_port_addmac(aggr_port_t *, uint_t, const uint8_t *);
+extern void aggr_port_remmac(aggr_port_t *, uint_t, const uint8_t *);
 
-extern int aggr_port_addvlan(aggr_port_t *, uint16_t);
-extern int aggr_port_remvlan(aggr_port_t *, uint16_t);
+extern int aggr_port_addvlan(aggr_port_t *, uint_t, uint16_t);
+extern int aggr_port_remvlan(aggr_port_t *, uint_t, uint16_t);
 
 extern mblk_t *aggr_ring_tx(void *, mblk_t *);
 extern mblk_t *aggr_find_tx_ring(void *, mblk_t *,

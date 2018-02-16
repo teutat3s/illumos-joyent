@@ -41,8 +41,14 @@
 #include <sys/aggr_impl.h>
 
 static void
-aggr_mac_rx(mac_handle_t lg_mh, mac_resource_handle_t mrh, mblk_t *mp)
+aggr_mac_rx(mac_handle_t lg_mh, mac_resource_handle_t mrh, mblk_t *mp,
+    boolean_t promisc_path)
 {
+	if (promisc_path) {
+		mac_aggr_promisc_dispatch(lg_mh, mp);
+		return;
+	}
+
 	if (mrh == NULL) {
 		mac_rx(lg_mh, mrh, mp);
 	} else {
@@ -51,17 +57,29 @@ aggr_mac_rx(mac_handle_t lg_mh, mac_resource_handle_t mrh, mblk_t *mp)
 	}
 }
 
+/* ARGSUSED */
 void
-aggr_recv_lacp(aggr_port_t *port, mac_resource_handle_t mrh, mblk_t *mp)
+aggr_recv_lacp(aggr_port_t *port, mac_resource_handle_t mrh, mblk_t *mp,
+    boolean_t promisc_path)
 {
 	aggr_grp_t *grp = port->lp_grp;
 
 	/* in promiscuous mode, send copy of packet up */
-	if (grp->lg_promisc) {
+	if (promisc_path) {
 		mblk_t *nmp = copymsg(mp);
 
+		/*
+		 * rpz: Don't call aggr_mac_rx(). Instead, reach into
+		 * the aggr's mci_promisc_list and perform promisc
+		 * dispatch here to prevent dup delivery during normal Rx.
+		 */
 		if (nmp != NULL)
-			aggr_mac_rx(grp->lg_mh, mrh, nmp);
+			mac_aggr_promisc_dispatch(grp->lg_mh, mp);
+
+		/*
+		 * rpz: Only deliver to promisc cb on promisc path.
+		 */
+		return;
 	}
 
 	aggr_lacp_rx_enqueue(port, mp);
@@ -85,13 +103,21 @@ aggr_recv_path_cb(void *arg, mac_resource_handle_t mrh, mblk_t *mp,
 	 * using flows for delivery which can result in duplicates
 	 * pushed up the stack. Only respect the chosen path.
 	 */
-	if (port->lp_promisc_on != promisc_path) {
-		freemsgchain(mp);
-		return;
-	}
+
+	/*
+	 * rpz: I'm removing this logic because now when promisc is
+	 * enabled aggr will have separate data paths: one dedicated
+	 * to promisc and another to normal Rx. But this function is
+	 * still shared by both datapaths to enforce the LACP logic.
+	 *
+	 * if (port->lp_promisc_on != promisc_path) {
+	 * 	freemsgchain(mp);
+	 * 	return;
+	 * }
+	 */
 
 	if (grp->lg_lacp_mode == AGGR_LACP_OFF) {
-		aggr_mac_rx(grp->lg_mh, mrh, mp);
+		aggr_mac_rx(grp->lg_mh, mrh, mp, promisc_path);
 	} else {
 		mblk_t *cmp, *last, *head;
 		struct ether_header *ehp;
@@ -114,8 +140,9 @@ aggr_recv_path_cb(void *arg, mac_resource_handle_t mrh, mblk_t *mp,
 					last->b_next = NULL;
 					if (port->lp_collector_enabled) {
 						aggr_mac_rx(grp->lg_mh, mrh,
-						    head);
+						    head, promisc_path);
 					} else {
+						/* rpz: kstat? */
 						freemsgchain(head);
 					}
 					head = cmp->b_next;
@@ -140,7 +167,8 @@ aggr_recv_path_cb(void *arg, mac_resource_handle_t mrh, mblk_t *mp,
 					ASSERT(last == NULL);
 					head = cmp->b_next;
 					cmp->b_next = NULL;
-					aggr_recv_lacp(port, mrh, cmp);
+					aggr_recv_lacp(port, mrh, cmp,
+					    promisc_path);
 					cmp = head;
 				} else {
 					/* previously accumulated packets */
@@ -149,14 +177,16 @@ aggr_recv_path_cb(void *arg, mac_resource_handle_t mrh, mblk_t *mp,
 					last->b_next = NULL;
 					if (port->lp_collector_enabled) {
 						aggr_mac_rx(grp->lg_mh, mrh,
-						    head);
+						    head, promisc_path);
 					} else {
+						/* rpz: kstat? */
 						freemsgchain(head);
 					}
 					/* unlink and pass up LACP packets */
 					head = cmp->b_next;
 					cmp->b_next = NULL;
-					aggr_recv_lacp(port, mrh, cmp);
+					aggr_recv_lacp(port, mrh, cmp,
+					    promisc_path);
 					cmp = head;
 					last = NULL;
 				}
@@ -167,9 +197,10 @@ aggr_recv_path_cb(void *arg, mac_resource_handle_t mrh, mblk_t *mp,
 		}
 		if (head != NULL) {
 			if (port->lp_collector_enabled)
-				aggr_mac_rx(grp->lg_mh, mrh, head);
+				aggr_mac_rx(grp->lg_mh, mrh, head,
+				    promisc_path);
 			else
-				freemsgchain(head);
+				freemsgchain(head); /* rpz: kstat? */
 		}
 	}
 }

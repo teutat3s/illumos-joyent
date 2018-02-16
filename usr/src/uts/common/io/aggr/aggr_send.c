@@ -225,7 +225,8 @@ aggr_ring_tx(void *arg, mblk_t *mp)
 	aggr_pseudo_tx_ring_t *pseudo_ring = (aggr_pseudo_tx_ring_t *)arg;
 	aggr_port_t *port = pseudo_ring->atr_port;
 
-	return (mac_hwring_send_priv(port->lp_mch, pseudo_ring->atr_hw_rh, mp));
+	return (mac_hwring_send_priv(port->lp_mchs[1], pseudo_ring->atr_hw_rh,
+		mp));
 }
 
 /*

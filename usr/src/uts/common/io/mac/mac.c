@@ -1119,8 +1119,13 @@ mac_start(mac_handle_t mh)
 			 * for receiving broadcast and multicast
 			 * traffic for both primary and non-primary
 			 * MAC clients.
+			 *
+			 * rpz: Ignore this assert for aggrs for now.
+			 * Perhaps add an MIS_IS_AGGR_PORT flag?
+			 *
+			 * ASSERT(defgrp->mrg_state ==
+			 * MAC_GROUP_STATE_REGISTERED);
 			 */
-			ASSERT(defgrp->mrg_state == MAC_GROUP_STATE_REGISTERED);
 			err = mac_start_group_and_rings(defgrp);
 			if (err != 0) {
 				mip->mi_active--;
@@ -1457,7 +1462,7 @@ mac_rx_group_unmark(mac_group_t *grp, uint_t flag)
  * used by the aggr driver to access and control the underlying HW Rx group
  * and rings. In this case, the aggr driver has exclusive control of the
  * underlying HW Rx group/rings, it calls the following functions to
- * start/stop the HW Rx rings, disable/enable polling, add/remove mac'
+ * start/stop the HW Rx rings, disable/enable polling, add/remove MAC
  * addresses, or set up the Rx callback.
  */
 /* ARGSUSED */
@@ -1491,9 +1496,15 @@ mac_hwrings_get(mac_client_handle_t mch, mac_group_handle_t *hwgh,
 	mac_client_impl_t	*mcip = (mac_client_impl_t *)mch;
 	flow_entry_t		*flent = mcip->mci_flent;
 	mac_group_t		*grp;
+	mac_group_t		*defrxgrp = MAC_DEFAULT_RX_GROUP(mcip->mci_mip);
 	mac_ring_t		*ring;
 	int			cnt = 0;
 
+	/*
+	 * rpz: The reason I needed the pre-reserve logic is because
+	 * otherwise fe_rx_ring_group would be NULL and aggr would
+	 * think there are no rings for this port client.
+	 */
 	if (rtype == MAC_RING_TYPE_RX) {
 		grp = flent->fe_rx_ring_group;
 	} else if (rtype == MAC_RING_TYPE_TX) {
@@ -1502,8 +1513,9 @@ mac_hwrings_get(mac_client_handle_t mch, mac_group_handle_t *hwgh,
 		ASSERT(B_FALSE);
 		return (-1);
 	}
+
 	/*
-	 * The mac client did not reserve any RX group, return directly.
+	 * The MAC client did not reserve an Rx group, return directly.
 	 * This is probably because the underlying MAC does not support
 	 * any groups.
 	 */
@@ -1513,14 +1525,18 @@ mac_hwrings_get(mac_client_handle_t mch, mac_group_handle_t *hwgh,
 		return (0);
 	/*
 	 * This group must be reserved by this mac client.
+	 *
+	 * rpz: The default group will NOT be in the reserved state.
 	 */
-	ASSERT((grp->mrg_state == MAC_GROUP_STATE_RESERVED) &&
+	ASSERT(((grp->mrg_state == MAC_GROUP_STATE_RESERVED) ||
+	    (rtype == MAC_RING_TYPE_RX && grp == defrxgrp)) &&
 	    (mcip == MAC_GROUP_ONLY_CLIENT(grp)));
 
 	for (ring = grp->mrg_rings; ring != NULL; ring = ring->mr_next, cnt++) {
 		ASSERT(cnt < MAX_RINGS_PER_GROUP);
 		hwrh[cnt] = (mac_ring_handle_t)ring;
 	}
+
 	if (hwgh != NULL)
 		*hwgh = (mac_group_handle_t)grp;
 
@@ -1542,10 +1558,25 @@ mac_hwring_getinfo(mac_ring_handle_t rh)
 	return (info->mri_flags);
 }
 
+void
+mac_hwring_set_direct(mac_ring_handle_t hwrh, mac_direct_rx_t func, void *arg1,
+    mac_resource_handle_t arg2)
+{
+	mac_ring_t *hwring = (mac_ring_t *)hwrh;
+
+	hwring->mr_pr_func = func;
+	hwring->mr_pr_arg1 = arg1;
+	hwring->mr_pr_arg2 = arg2;
+}
+
 /*
  * Export ddi interrupt handles from the HW ring to the pseudo ring and
- * setup the RX callback of the mac client which exclusively controls
+ * setup the Rx callback of the MAC client which exclusively controls
  * HW ring.
+ *
+ * prh is the aggr_pseudo_ring_t.
+ *
+ * pseudo_rh is the mac_ring_t of the aggr_pseudo_ring_t.
  */
 void
 mac_hwring_setup(mac_ring_handle_t hwrh, mac_resource_handle_t prh,
@@ -1572,8 +1603,26 @@ mac_hwring_setup(mac_ring_handle_t hwrh, mac_resource_handle_t prh,
 		hw_ring->mr_prh = pseudo_rh;
 	}
 
-	if (hw_ring->mr_type == MAC_RING_TYPE_RX) {
-		ASSERT(!(mac_srs->srs_type & SRST_TX));
+	if (hw_ring->mr_type == MAC_RING_TYPE_RX && mac_srs != NULL) {
+		/*
+		 * The pseudo ring must have an SRS to deliver to.
+		 *
+		 * rpz: The HW ring SRS no longer exists. It never
+		 * made sense in the first place.
+		 *
+		 * a) The client of the HW ring is the aggr port, not
+		 *    an IP client -- doing fanout at this level would be
+		 *    a waste.
+		 *
+		 * b) We created the port client SRS but never used
+		 *    it. The purpose of the sr_lower_proc assignment
+		 *    below was to bypass the port client SRS
+		 *
+		 * I'm leaving this code here, for now. But it was
+		 * replaced with the pseudo ring direct callback, see
+		 * mac_hwring_set_direct().
+		 *
+		 */
 		mac_srs->srs_mrh = prh;
 		mac_srs->srs_rx.sr_lower_proc = mac_hwrings_rx_process;
 	}
@@ -1583,17 +1632,11 @@ void
 mac_hwring_teardown(mac_ring_handle_t hwrh)
 {
 	mac_ring_t		*hw_ring = (mac_ring_t *)hwrh;
-	mac_soft_ring_set_t	*mac_srs;
 
 	if (hw_ring == NULL)
 		return;
+
 	hw_ring->mr_prh = NULL;
-	if (hw_ring->mr_type == MAC_RING_TYPE_RX) {
-		mac_srs = hw_ring->mr_srs;
-		ASSERT(!(mac_srs->srs_type & SRST_TX));
-		mac_srs->srs_rx.sr_lower_proc = mac_rx_srs_process;
-		mac_srs->srs_mrh = NULL;
-	}
 }
 
 int
@@ -1758,6 +1801,50 @@ mac_has_hw_vlan(mac_handle_t mh)
 	mac_impl_t *mip = (mac_impl_t *)mh;
 
 	return (MAC_GROUP_HW_VLAN(mip->mi_rx_groups));
+}
+
+/*
+ * Get the index of the HW group underlying this client.
+ */
+uint_t
+mac_hwgroup_get_index(mac_client_handle_t mch)
+{
+	mac_client_impl_t *mcip = (mac_client_impl_t *)mch;
+	mac_group_t *grp = mcip->mci_flent->fe_rx_ring_group;
+
+	return (grp->mrg_index);
+}
+
+/*
+ * Get the number of Rx HW groups on this MAC.
+ */
+uint_t
+mac_get_num_rx_groups(mac_handle_t mh)
+{
+	mac_impl_t *mip = (mac_impl_t *)mh;
+
+	return (mip->mi_rx_group_count);
+}
+
+/*
+ * Private function used by aggr to perform promisc dispatch.
+ */
+void
+mac_aggr_promisc_dispatch(mac_handle_t mh, mblk_t *mp)
+{
+	mac_impl_t *mip = (mac_impl_t *)mh;
+
+	if (mip->mi_promisc_list != NULL)
+		mac_promisc_dispatch(mip, mp, NULL, B_FALSE);
+}
+
+void
+mac_aggr_set_promisc(mac_handle_t mh, boolean_t value)
+{
+	mac_impl_t *mip = (mac_impl_t *)mh;
+
+	ASSERT(MAC_PERIM_HELD(mip));
+	VERIFY3S(i_mac_promisc_set(mip, value), ==, 0);
 }
 
 /*
@@ -2457,17 +2544,14 @@ mac_rx_classify(mac_impl_t *mip, mac_resource_handle_t mrh, mblk_t *mp)
 	int		err;
 
 	/*
-	 * If the MAC is a port of an aggregation, pass FLOW_IGNORE_VLAN
-	 * to mac_flow_lookup() so that the VLAN packets can be successfully
-	 * passed to the non-VLAN aggregation flows.
+	 * rpz: There should be an MIS_IS_AGGR_PORT because
+	 * MIS_EXCLUSIVE also includes sun4v vnet and I have no idea
+	 * what that thing wants.
 	 *
-	 * Note that there is possibly a race between this and
-	 * mac_unicast_remove/add() and VLAN packets could be incorrectly
-	 * classified to non-VLAN flows of non-aggregation MAC clients. These
-	 * VLAN packets will be then filtered out by the MAC module.
+	 * We should never perform classification on the aggr port --
+	 * that should be done on the aggr client's SRS.
 	 */
-	if ((mip->mi_state_flags & MIS_EXCLUSIVE) != 0)
-		flags |= FLOW_IGNORE_VLAN;
+	ASSERT((mip->mi_state_flags & MIS_EXCLUSIVE) == 0);
 
 	err = mac_flow_lookup(mip->mi_flow_tab, mp, flags, &flent);
 	if (err != 0) {
@@ -2533,6 +2617,9 @@ mac_tx_flow_srs_wakeup(flow_entry_t *flent, void *arg)
 	return (0);
 }
 
+/*
+ * rpz: Make sure this still works with my new aggr code.
+ */
 void
 i_mac_tx_srs_notify(mac_impl_t *mip, mac_ring_handle_t ring)
 {
@@ -3736,7 +3823,13 @@ mac_start_ring(mac_ring_t *ring)
 {
 	int rv = 0;
 
-	ASSERT(ring->mr_state == MR_FREE);
+	/*
+	 * rpz: Hack to appease aggrs for now.
+	 */
+	if (ring->mr_state == MR_INUSE)
+		return (rv);
+
+	/* ASSERT(ring->mr_state == MR_FREE); */
 
 	if (ring->mr_start != NULL) {
 		rv = ring->mr_start(ring->mr_driver, ring->mr_gen_num);
@@ -3796,12 +3889,18 @@ mac_start_group_and_rings(mac_group_t *group)
 	mac_ring_t	*ring;
 	int		rv = 0;
 
-	ASSERT(group->mrg_state == MAC_GROUP_STATE_REGISTERED);
+	/*
+	 * rpz: Hack to appease aggrs.
+	 *
+	 * ASSERT(group->mrg_state == MAC_GROUP_STATE_REGISTERED);
+	 */
 	if ((rv = mac_start_group(group)) != 0)
 		return (rv);
 
 	for (ring = group->mrg_rings; ring != NULL; ring = ring->mr_next) {
-		ASSERT(ring->mr_state == MR_FREE);
+		/* rpz: Hack to appease aggrs. */
+		/* ASSERT(ring->mr_state == MR_FREE); */
+
 		if ((rv = mac_start_ring(ring)) != 0)
 			goto error;
 		ring->mr_classify_type = MAC_SW_CLASSIFIER;
@@ -6542,6 +6641,8 @@ i_mac_clients_hw(mac_group_t *grp, uint32_t mask)
  * fanout requirements) and the address type.
  * If the requestor is the pimary MAC then return the group with the
  * largest number of rings, otherwise the default ring when available.
+ *
+ * If we are pre-reserving an Rx group then mac_addr is NULL.
  */
 mac_group_t *
 mac_reserve_rx_group(mac_client_impl_t *mcip, uint8_t *mac_addr, boolean_t move)
@@ -6571,8 +6672,12 @@ mac_reserve_rx_group(mac_client_impl_t *mcip, uint8_t *mac_addr, boolean_t move)
 	/*
 	 * Check if a group already has this MAC address (case of VLANs)
 	 * unless we are moving this MAC client from one group to another.
+	 *
+	 * If mac_addr is NULL we are pre-reserving an Rx group for a
+	 * client.
 	 */
-	if (!move && (map = mac_find_macaddr(mip, mac_addr)) != NULL) {
+	if (!move && mac_addr != NULL &&
+	    (map = mac_find_macaddr(mip, mac_addr)) != NULL) {
 		if (map->ma_group != NULL)
 			return (map->ma_group);
 	}
@@ -6583,8 +6688,12 @@ mac_reserve_rx_group(mac_client_impl_t *mcip, uint8_t *mac_addr, boolean_t move)
 	/*
 	 * If this client is requesting exclusive MAC access then
 	 * return NULL to ensure the client uses the default group.
+	 *
+	 * Aggr ports hold exclusive access to a MAC but also open a
+	 * client per MAC group.
 	 */
-	if (mcip->mci_state_flags & MCIS_EXCLUSIVE)
+	if (mcip->mci_state_flags & MCIS_EXCLUSIVE &&
+	    !(mcip->mci_state_flags & MCIS_IS_AGGR_PORT))
 		return (NULL);
 
 	/* For dynamic groups default unspecified to 1 */

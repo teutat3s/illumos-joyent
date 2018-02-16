@@ -97,7 +97,16 @@ typedef enum {
 #define	MAC_UNICAST_STRIP_DISABLE		0x0020
 #define	MAC_UNICAST_DISABLE_TX_VID_CHECK	0x0040
 
-/* flags passed to mac_client_open */
+/*
+ * Flags passed to mac_client_open.()
+ *
+ * MAC_OPEN_FLAGS_RESERVE_RX_GRP
+ *
+ *	Reserve a Rx group for the client during open. Typically,
+ *	group reservation is done upon adding a unicast address to the
+ *	client. But some clients, such as aggr port clients, need to
+ *	reserve a group ahead of time.
+ */
 #define	MAC_OPEN_FLAGS_IS_VNIC			0x0001
 #define	MAC_OPEN_FLAGS_EXCLUSIVE		0x0002
 #define	MAC_OPEN_FLAGS_IS_AGGR_PORT		0x0004
@@ -105,11 +114,13 @@ typedef enum {
 #define	MAC_OPEN_FLAGS_USE_DATALINK_NAME	0x0010
 #define	MAC_OPEN_FLAGS_MULTI_PRIMARY		0x0020
 #define	MAC_OPEN_FLAGS_NO_UNICAST_ADDR		0x0040
+#define	MAC_OPEN_FLAGS_RESERVE_RX_GRP		0x0080
 
 /* flags passed to mac_client_close */
 #define	MAC_CLOSE_FLAGS_IS_VNIC		0x0001
 #define	MAC_CLOSE_FLAGS_EXCLUSIVE	0x0002
 #define	MAC_CLOSE_FLAGS_IS_AGGR_PORT	0x0004
+#define	MAC_CLOSE_FLAGS_RESERVE_RX_GRP	0x0008
 
 /* flags passed to mac_promisc_add() */
 #define	MAC_PROMISC_FLAGS_NO_TX_LOOP		0x0001

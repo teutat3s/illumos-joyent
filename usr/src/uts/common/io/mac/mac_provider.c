@@ -694,6 +694,10 @@ mac_trill_snoop(mac_handle_t mh, mblk_t *mp)
 /*
  * This is the upward reentry point for packets arriving from the bridging
  * module and from mac_rx for links not part of a bridge.
+ *
+ * rpz: I don't have to worry about SW classify of the HW ring because
+ * there is never more than 1 port client per HW group. If any of the
+ * HW rings go into MAC_SW_CLASSIFIER mode then it's a bug.
  */
 void
 mac_rx_common(mac_handle_t mh, mac_resource_handle_t mrh, mblk_t *mp_chain)
@@ -707,11 +711,26 @@ mac_rx_common(mac_handle_t mh, mac_resource_handle_t mrh, mblk_t *mp_chain)
 	/*
 	 * If there are any promiscuous mode callbacks defined for
 	 * this MAC, pass them a copy if appropriate.
+	 *
+	 * rpz: I want to set promisc on the NIC but I should
+	 * dispatcha against the aggr's mip (not the HW rings's mip).
 	 */
 	if (mip->mi_promisc_list != NULL)
 		mac_promisc_dispatch(mip, mp_chain, NULL, B_FALSE);
 
 	if (mr != NULL) {
+		/*
+		 * If there is a direct callback, then pass the chain
+		 * up to the pseudo ring.
+		 */
+		if (mr->mr_pr_func != NULL) {
+			mutex_enter(&mr->mr_lock);
+			mr->mr_pr_func(mr->mr_pr_arg1, mr->mr_pr_arg2, mp_chain,
+			    B_FALSE);
+			mutex_exit(&mr->mr_lock);
+			return;
+		}
+
 		/*
 		 * If the SRS teardown has started, just return. The 'mr'
 		 * continues to be valid until the driver unregisters the mac.
@@ -721,12 +740,14 @@ mac_rx_common(mac_handle_t mh, mac_resource_handle_t mrh, mblk_t *mp_chain)
 		 * structure that can be freed much before mac_unregister.
 		 */
 		mutex_enter(&mr->mr_lock);
+
 		if ((mr->mr_state != MR_INUSE) || (mr->mr_flag &
 		    (MR_INCIPIENT | MR_CONDEMNED | MR_QUIESCE))) {
 			mutex_exit(&mr->mr_lock);
 			freemsgchain(mp_chain);
 			return;
 		}
+
 		if (mr->mr_classify_type == MAC_HW_CLASSIFIER) {
 			hw_classified = B_TRUE;
 			MR_REFHOLD_LOCKED(mr);
@@ -740,18 +761,22 @@ mac_rx_common(mac_handle_t mh, mac_resource_handle_t mrh, mblk_t *mp_chain)
 		 * to reach the right place.
 		 */
 		if (hw_classified) {
+			ASSERT3P(mr->mr_srs, !=, NULL);
 			mac_srs = mr->mr_srs;
+
 			/*
-			 * This is supposed to be the fast path.
-			 * All packets received though here were steered by
-			 * the hardware classifier, and share the same
-			 * MAC header info.
+			 * This is supposed to be the fast path. All
+			 * packets received though here were steered
+			 * by the hardware classifier, and share the
+			 * same MAC header info.
 			 */
 			mac_srs->srs_rx.sr_lower_proc(mh,
 			    (mac_resource_handle_t)mac_srs, mp_chain, B_FALSE);
 			MR_REFRELE(mr);
 			return;
 		}
+
+		ASSERT(mr->mr_classify_type == MAC_SW_CLASSIFIER);
 		/* We'll fall through to software classification */
 	} else {
 		flow_entry_t *flent;

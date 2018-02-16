@@ -654,7 +654,7 @@ lacp_xmit_sm(aggr_port_t *portp)
 	    (lacp_t *)(mp->b_rptr + sizeof (struct ether_header)));
 
 	/* Send the packet over the first TX ring */
-	mp = mac_hwring_send_priv(portp->lp_mch, portp->lp_tx_rings[0], mp);
+	mp = mac_hwring_send_priv(portp->lp_mchs[1], portp->lp_tx_rings[0], mp);
 	if (mp != NULL)
 		freemsg(mp);
 
@@ -2303,7 +2303,7 @@ aggr_lacp_rx(mblk_t *dmp)
 			break;
 
 		/* Send the packet over the first TX ring */
-		dmp = mac_hwring_send_priv(portp->lp_mch,
+		dmp = mac_hwring_send_priv(portp->lp_mchs[1],
 		    portp->lp_tx_rings[0], dmp);
 		if (dmp != NULL)
 			freemsg(dmp);

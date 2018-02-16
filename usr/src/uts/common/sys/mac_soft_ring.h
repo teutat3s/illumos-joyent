@@ -354,6 +354,9 @@ struct mac_soft_ring_set_s {
 	 * If the associated ring is exclusively used by a mac client, e.g.,
 	 * an aggregation, this fields is used to keep a reference to the
 	 * MAC client's pseudo ring.
+	 *
+	 * rpz: Upate this comment; this field is no longer needed by
+	 * aggr. But who knows what the hell sun4v wants.
 	 */
 	mac_resource_handle_t	srs_mrh;
 	/*

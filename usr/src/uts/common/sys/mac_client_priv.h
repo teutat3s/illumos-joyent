@@ -124,6 +124,8 @@ extern void mac_srs_perm_quiesce(mac_client_handle_t, boolean_t);
 extern int mac_hwrings_get(mac_client_handle_t, mac_group_handle_t *,
     mac_ring_handle_t *, mac_ring_type_t);
 extern uint_t mac_hwring_getinfo(mac_ring_handle_t);
+extern void mac_hwring_set_direct(mac_ring_handle_t, mac_direct_rx_t, void *,
+    mac_resource_handle_t);
 extern void mac_hwring_setup(mac_ring_handle_t, mac_resource_handle_t,
     mac_ring_handle_t);
 extern void mac_hwring_teardown(mac_ring_handle_t);
@@ -148,6 +150,11 @@ extern int mac_hwgroup_addvlan(mac_group_handle_t, uint16_t);
 extern int mac_hwgroup_remvlan(mac_group_handle_t, uint16_t);
 
 extern boolean_t mac_has_hw_vlan(mac_handle_t);
+
+extern uint_t mac_hwgroup_get_index(mac_client_handle_t);
+extern uint_t mac_get_num_rx_groups(mac_handle_t);
+extern void mac_aggr_promisc_dispatch(mac_handle_t, mblk_t *);
+extern void mac_aggr_set_promisc(mac_handle_t, boolean_t);
 
 extern void mac_set_upper_mac(mac_client_handle_t, mac_handle_t,
     mac_resource_props_t *);
