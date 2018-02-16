@@ -10,33 +10,25 @@
 #
 
 #
-# Copyright 2018 Joyent, Inc.
+# Copyright 2018, Joyent, Inc.
 #
 
-PROG =			gen_errno
+LIBRARY =	libcustr.a
+VERS =		.1
+OBJECTS =	custr.o
 
-include ../../../../cmd/Makefile.cmd
+include $(SRC)/lib/Makefile.lib
 
-OBJS =			gen_errno.o
+LIBS =		$(DYNLIB) $(LINTLIB)
+LDLIBS +=	-lc
+CPPFLAGS +=	-D__EXTENSIONS__
 
-CLOBBERFILES +=		$(PROG)
-
-NATIVECC_CFLAGS +=	$(CFLAGS) $(CCVERBOSE)
-NATIVECC_LDLIBS +=	-lcustr -lnvpair
+SRCDIR =	../common
 
 .KEEP_STATE:
 
-all: $(PROG)
+all: $(LIBS)
 
-install: all
+lint: lintcheck
 
-lint:	lint_PROG
-
-clean:
-	$(RM) $(OBJS)
-
-$(PROG): $(OBJS)
-	$(NATIVECC) $(NATIVECC_CFLAGS) $(NATIVECC_LDLIBS) $(OBJS) -o $@
-	$(POST_PROCESS)
-
-include ../../../../cmd/Makefile.targ
+include $(SRC)/lib/Makefile.targ

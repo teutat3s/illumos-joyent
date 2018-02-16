@@ -10,7 +10,7 @@
 #
 
 #
-# Copyright 2015 Joyent, Inc.
+# Copyright 2018 Joyent, Inc.
 #
 
 LIBRARY =	libvarpd_files.a
@@ -22,7 +22,7 @@ include ../../../Makefile.lib
 include ../../Makefile.plugin
 
 LIBS =		$(DYNLIB)
-LDLIBS +=	-lc -lumem -lnvpair -lsocket -lnsl -lcmdutils
+LDLIBS +=	-lc -lumem -lnvpair -lsocket -lnsl -lcustr
 CPPFLAGS +=	-I../common
 
 LINTFLAGS +=	-erroff=E_BAD_PTR_CAST_ALIGN
