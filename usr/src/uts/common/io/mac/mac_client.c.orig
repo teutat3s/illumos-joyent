@@ -1529,24 +1529,6 @@ mac_client_close(mac_client_handle_t mch, uint16_t flags)
 		return;
 	}
 
-	flent = mcip->mci_flent;
-
-	if ((flags & MAC_CLOSE_FLAGS_RESERVE_RX_GRP) != 0) {
-		mac_client_impl_t	*unused;
-		mac_group_state_t	next_state;
-		mac_group_t		*rgroup;
-		mac_group_t		*def_rgroup;
-
-		mcip->mci_state_flags &= ~MCIS_RX_GRP_PRE_RESERVE;
-		rgroup = flent->fe_rx_ring_group;
-		def_rgroup = MAC_DEFAULT_RX_GROUP(mip);
-
-		mac_group_remove_client(rgroup, mcip);
-		next_state = mac_group_next_state(rgroup, &unused, def_rgroup,
-		    B_TRUE);
-		mac_set_group_state(rgroup, next_state);
-	}
-
 	/* If we have only setup up minimal datapth setup, tear it down */
 	if (mcip->mci_state_flags & MCIS_NO_UNICAST_ADDR) {
 		mac_client_datapath_teardown((mac_client_handle_t)mcip, NULL,
@@ -1557,6 +1539,7 @@ mac_client_close(mac_client_handle_t mch, uint16_t flags)
 	/*
 	 * Remove the flent associated with the MAC client
 	 */
+	flent = mcip->mci_flent;
 	mcip->mci_flent = NULL;
 	FLOW_FINAL_REFRELE(flent);
 
@@ -2478,14 +2461,7 @@ done_setup:
 	if (flent->fe_rx_ring_group != NULL)
 		mac_rx_group_unmark(flent->fe_rx_ring_group, MR_INCIPIENT);
 	FLOW_UNMARK(flent, FE_INCIPIENT);
-
-	/*
-	 * rpz: Aggr ports should never receive traffic; bad things
-	 * happen if they do.
-	 */
-	if ((mcip->mci_state_flags & MCIS_IS_AGGR_PORT) == 0)
-		FLOW_UNMARK(flent, FE_MC_NO_DATAPATH);
-
+	FLOW_UNMARK(flent, FE_MC_NO_DATAPATH);
 	mac_tx_client_unblock(mcip);
 	return (0);
 bail:
@@ -4288,9 +4264,8 @@ mac_capab_get(mac_handle_t mh, mac_capab_t cap, void *cap_data)
 	mac_impl_t *mip = (mac_impl_t *)mh;
 
 	/*
-	 * Some capabilities are restricted when there are more than one active
-	 * clients on the MAC resource.  The ones noted below are safe,
-	 * independent of that count.
+	 * if mi_nactiveclients > 1, only MAC_CAPAB_LEGACY, MAC_CAPAB_HCKSUM,
+	 * MAC_CAPAB_NO_NATIVEVLAN and MAC_CAPAB_NO_ZCOPY can be advertised.
 	 */
 	if (mip->mi_nactiveclients > 1) {
 		switch (cap) {
@@ -4298,7 +4273,6 @@ mac_capab_get(mac_handle_t mh, mac_capab_t cap, void *cap_data)
 			return (B_TRUE);
 		case MAC_CAPAB_LEGACY:
 		case MAC_CAPAB_HCKSUM:
-		case MAC_CAPAB_LSO:
 		case MAC_CAPAB_NO_NATIVEVLAN:
 			break;
 		default:
