@@ -33,6 +33,8 @@
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  *
+ * Copyright 2018, Joyent, Inc.
+ *
  * File: rdn_parser.c
  */
 
@@ -534,4 +536,119 @@ kmf_dn_parser(char *string, KMF_X509_NAME *name)
 
 	err = ParseDistinguishedName(string, (int)strlen(string), name);
 	return (err);
+}
+
+static KMF_RETURN
+ava_to_string(KMF_X509_TYPE_VALUE_PAIR *tvp, char *string, size_t *lenp)
+{
+	KMF_OID *kind_oid;
+	KMF_OID *rdn_oid;
+	size_t i;
+
+	for (i = 0; name2kinds[i].name != NULL; i++) {
+		kind_oid = name2kinds[i].OID;
+		rdn_oid = &tvp->type;
+
+		if (kind_oid->Length != rdn_oid->Length)
+			continue;
+		if (memcmp(kind_oid->Data, rdn_oid->Data, rdn_oid->Length) != 0)
+			continue;
+
+		if (string == NULL) {
+			*lenp += strlen(name2kinds[i].name);
+			*lenp += 1;	/* = */
+			/* Does this include NUL? */
+			*lenp += tvp->value.Length;
+		} else {
+			(void) strlcat(string, name2kinds[i].name, *lenp);
+			(void) strlcat(string, "=", *lenp);
+			(void) strlcat(string, (const char *)tvp->value.Data,
+			    *lenp);
+		}
+		return (KMF_OK);
+	}
+
+	if (string == NULL) {
+		/* XXX: get size of oid string */
+		*lenp += 1;	/* = */
+		*lenp += tvp->value.Length;
+		return (KMF_OK);
+	}
+
+	/* XXX: write oid string */
+	(void) strlcat(string, "=", *lenp);
+	(void) strlcat(string, (const char *)tvp->value.Data, *lenp);
+	return (KMF_OK);
+}
+
+static KMF_RETURN
+rdn_to_string(KMF_X509_RDN *rdn, char *string, size_t *lenp)
+{
+	KMF_RETURN ret;
+	size_t i;
+
+	for (i = 0; i < rdn->numberOfPairs; i++) {
+		if (i > 0) {
+			if (string == NULL)
+				*lenp += 1;	/* + */
+			else
+				(void) strlcat(string, "+", *lenp);
+		}
+
+		ret = ava_to_string(&rdn->AttributeTypeAndValue[i], string,
+		    lenp);
+		if (ret != KMF_OK)
+			return (ret);
+	}
+
+	return (KMF_OK);
+}
+
+/*
+ * kmf_dn_to_string
+ *
+ * Take a binary KMF_X509_NAME and convert it into a human readable string.
+ */
+KMF_RETURN
+kmf_dn_to_string(KMF_X509_NAME *name, char **string)
+{
+	KMF_RETURN err;
+	size_t i, slen = 0;
+
+	if (name == NULL || string == NULL)
+		return (KMF_ERR_BAD_PARAMETER);
+
+	for (i = 0; i < name->numberOfRDNs; i++) {
+		KMF_X509_RDN *rdn = &name->RelativeDistinguishedName[i];
+
+		if (i > 0)
+			slen += 1;	/* , */
+
+		err = rdn_to_string(rdn, NULL, &slen);
+		if (err != KMF_OK)
+			return (err);
+	}
+
+	/* Add terminating NUL */
+	slen += 1;
+
+	*string = malloc(slen);
+	if (*string == NULL)
+		return (KMF_ERR_MEMORY);
+
+	for (i = 0; i < name->numberOfRDNs; i++) {
+		KMF_X509_RDN *rdn = &name->RelativeDistinguishedName[i];
+
+		if (i > 0)
+			(void) strlcat(*string, ",", slen);
+
+		err = rdn_to_string(rdn, *string, &slen);
+		if (err != KMF_OK) {
+			free(*string);
+			*string = NULL;
+			return (KMF_ERR_RDN_ATTR);
+		}
+	}
+
+	return (KMF_OK);
 }
