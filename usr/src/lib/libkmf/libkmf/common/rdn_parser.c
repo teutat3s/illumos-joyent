@@ -549,9 +549,7 @@ ava_to_string(KMF_X509_TYPE_VALUE_PAIR *tvp, char *string, size_t *lenp)
 		kind_oid = name2kinds[i].OID;
 		rdn_oid = &tvp->type;
 
-		if (kind_oid->Length != rdn_oid->Length)
-			continue;
-		if (memcmp(kind_oid->Data, rdn_oid->Data, rdn_oid->Length) != 0)
+		if (!IsEqualOid(kind_oid, rdn_oid))
 			continue;
 
 		if (string == NULL) {
@@ -608,6 +606,8 @@ rdn_to_string(KMF_X509_RDN *rdn, char *string, size_t *lenp)
  * kmf_dn_to_string
  *
  * Take a binary KMF_X509_NAME and convert it into a human readable string.
+ * XXX: This should probably add necessary escapes.. e.g
+ * "CN=foo, O=Acme\, Inc., ...."
  */
 KMF_RETURN
 kmf_dn_to_string(KMF_X509_NAME *name, char **string)
