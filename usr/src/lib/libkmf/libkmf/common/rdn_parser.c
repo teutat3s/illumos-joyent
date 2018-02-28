@@ -46,6 +46,7 @@
 #include <rdn_parser.h>
 #include <stdio.h>
 #include <values.h>
+#include <libcmdutils.h> /* for custr */
 
 /*
  * The order here is important.  The OIDs are arranged in order of
@@ -538,63 +539,122 @@ kmf_dn_parser(char *string, KMF_X509_NAME *name)
 	return (err);
 }
 
+/*
+ * Convert an RDN value into a printable name with appropriate escaping
+ */
 static KMF_RETURN
-ava_to_string(KMF_X509_TYPE_VALUE_PAIR *tvp, char *string, size_t *lenp)
+value_to_string(KMF_DATA *data, custr_t *str)
+{
+	size_t i;
+	uchar_t c;
+
+	for (i = 0; i < data->Length; i++) {
+		c = data->Data[i];
+
+		/*
+		 * While technically not required, it is suggested that
+		 * printable non-ascii characters (e.g. multi-byte UTF-8
+		 * characters) are converted as escaped hex (as well as
+		 * unprintable characters).  AFAIK there is no one canonical
+		 * string representation (e.g. attribute names are case
+		 * insensitive, so 'CN=foo' and 'cn=foo' convert to the same
+		 * binary representation, but there is nothing to say if
+		 * either string form is preferred), so this shouldn't
+		 * pose a problem.
+		 */
+		if (c < ' ' || c >= 0x7f) {
+			if (custr_append_printf(str, "\\x%02hhx", c) != 0)
+				return (KMF_ERR_MEMORY);
+			continue;
+		}
+
+		switch (c) {
+		case '#':
+			/* Escape # if at the start of a value */
+			if (i != 0)
+				break;
+			/*FALLTHRU*/
+		case ' ':
+			/* Escape ' ' if at the start or end of a value */
+			if (i != 0 && i + 1 != data->Length)
+				break;
+			/*FALLTHRU*/
+		case '"':
+		case '+':
+		case ',':
+		case ';':
+		case '<':
+		case '>':
+		case '\\':
+			/* Escape these */
+			if (custr_appendc(str, '\\') != 0)
+				return (KMF_ERR_MEMORY);
+		}
+
+		if (custr_appendc(str, c) != 0)
+			return (KMF_ERR_MEMORY);
+	}
+
+	return (KMF_OK);
+}
+
+/*
+ * Translate an attribute/value pair into a string.  If the attribute OID
+ * is a well known OID (in name2kinds) we use the name instead of the OID.
+ */
+static KMF_RETURN
+ava_to_string(KMF_X509_TYPE_VALUE_PAIR *tvp, custr_t *str)
 {
 	KMF_OID *kind_oid;
-	KMF_OID *rdn_oid;
+	KMF_OID *rdn_oid = &tvp->type;
+	const char *attr = NULL;
 	size_t i;
+	KMF_RETURN ret = KMF_OK;
+	boolean_t found = B_FALSE;
 
 	for (i = 0; name2kinds[i].name != NULL; i++) {
 		kind_oid = name2kinds[i].OID;
-		rdn_oid = &tvp->type;
 
 		if (!IsEqualOid(kind_oid, rdn_oid))
 			continue;
 
-		if (string == NULL) {
-			*lenp += strlen(name2kinds[i].name);
-			*lenp += 1;	/* = */
-			/* Does this include NUL? */
-			*lenp += tvp->value.Length;
-		} else {
-			(void) strlcat(string, name2kinds[i].name, *lenp);
-			(void) strlcat(string, "=", *lenp);
-			(void) strlcat(string, (const char *)tvp->value.Data,
-			    *lenp);
-		}
-		return (KMF_OK);
+		attr = name2kinds[i].name;
+		found = B_TRUE;
+		break;
 	}
 
-	if (string == NULL) {
-		/* XXX: get size of oid string */
-		*lenp += 1;	/* = */
-		*lenp += tvp->value.Length;
-		return (KMF_OK);
+	if (!found && (attr = kmf_oid_to_string(rdn_oid)) == NULL) {
+		ret = KMF_ERR_MEMORY;
+		goto done;
 	}
+	if (custr_append(str, attr) != 0) {
+		ret = KMF_ERR_MEMORY;
+		goto done;
+	}
+	if (custr_appendc(str, '=') != 0) {
+		ret = KMF_ERR_MEMORY;
+		goto done;
+	}
+	ret = value_to_string(&tvp->value, str);
 
-	/* XXX: write oid string */
-	(void) strlcat(string, "=", *lenp);
-	(void) strlcat(string, (const char *)tvp->value.Data, *lenp);
-	return (KMF_OK);
+done:
+	if (!found)
+		free((void *)attr);
+
+	return (ret);
 }
 
 static KMF_RETURN
-rdn_to_string(KMF_X509_RDN *rdn, char *string, size_t *lenp)
+rdn_to_string(KMF_X509_RDN *rdn, custr_t *str)
 {
 	KMF_RETURN ret;
 	size_t i;
 
 	for (i = 0; i < rdn->numberOfPairs; i++) {
-		if (i > 0) {
-			if (string == NULL)
-				*lenp += 1;	/* + */
-			else
-				(void) strlcat(string, "+", *lenp);
-		}
+		if (i > 0 && custr_appendc(str, '+') != 0)
+			return (KMF_ERR_MEMORY);
 
-		ret = ava_to_string(&rdn->AttributeTypeAndValue[i], string,
-		    lenp);
+		ret = ava_to_string(&rdn->AttributeTypeAndValue[i], str);
 		if (ret != KMF_OK)
 			return (ret);
 	}
@@ -606,49 +666,38 @@ rdn_to_string(KMF_X509_RDN *rdn, char *string, size_t *lenp)
  * kmf_dn_to_string
  *
  * Take a binary KMF_X509_NAME and convert it into a human readable string.
- * XXX: This should probably add necessary escapes.. e.g
- * "CN=foo, O=Acme\, Inc., ...."
  */
 KMF_RETURN
 kmf_dn_to_string(KMF_X509_NAME *name, char **string)
 {
-	KMF_RETURN err;
-	size_t i, slen = 0;
+	custr_t *str = NULL;
+	KMF_RETURN err = KMF_OK;
+	size_t i;
 
 	if (name == NULL || string == NULL)
 		return (KMF_ERR_BAD_PARAMETER);
 
-	for (i = 0; i < name->numberOfRDNs; i++) {
-		KMF_X509_RDN *rdn = &name->RelativeDistinguishedName[i];
+	*string = NULL;
 
-		if (i > 0)
-			slen += 1;	/* , */
-
-		err = rdn_to_string(rdn, NULL, &slen);
-		if (err != KMF_OK)
-			return (err);
-	}
-
-	/* Add terminating NUL */
-	slen += 1;
-
-	*string = malloc(slen);
-	if (*string == NULL)
+	if (custr_alloc(&str) != 0)
 		return (KMF_ERR_MEMORY);
 
 	for (i = 0; i < name->numberOfRDNs; i++) {
 		KMF_X509_RDN *rdn = &name->RelativeDistinguishedName[i];
 
-		if (i > 0)
-			(void) strlcat(*string, ",", slen);
-
-		err = rdn_to_string(rdn, *string, &slen);
-		if (err != KMF_OK) {
-			free(*string);
-			*string = NULL;
-			return (KMF_ERR_RDN_ATTR);
+		if (i > 0 && custr_append(str, ", ") != 0) {
+			err = KMF_ERR_MEMORY;
+			goto done;
 		}
+
+		if ((err = rdn_to_string(rdn, str)) != KMF_OK)
+			goto done;
 	}
 
-	return (KMF_OK);
+	if ((*string = strdup(custr_cstr(str))) == NULL)
+		err = KMF_ERR_MEMORY;
+
+done:
+	custr_free(str);
+	return (err);
 }

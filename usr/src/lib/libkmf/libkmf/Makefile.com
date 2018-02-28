@@ -57,7 +57,7 @@ LIBS=	$(DYNLIB) $(LINTLIB)
 $(LINTLIB) := SRCS = $(SRCDIR)/$(LINTSRC)
 
 LDLIBS	+=	$(BERDERLIB) $(CRYPTOUTILLIB) -lmd -lpkcs11 -lnsl -lsocket -lc 
-LDLIBS6	+=	$(BERDERLIB64) $(CRYPTOUTILLIB64) -lmd -lpkcs11 -lnsl -lsocket -lc 
+LDLIBS	+=	-lcmdutils
 
 # DYNLIB libraries do not have lint libs and are not linted
 $(DYNLIB) :=    LDLIBS += -lxml2
