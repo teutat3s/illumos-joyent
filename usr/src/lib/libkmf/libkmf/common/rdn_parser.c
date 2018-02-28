@@ -539,8 +539,35 @@ kmf_dn_parser(char *string, KMF_X509_NAME *name)
 	return (err);
 }
 
+static const char hexdigits[] = "0123456789abcdef";
+
+static KMF_RETURN
+binvalue_to_string(KMF_DATA *data, custr_t *str)
+{
+	size_t i;
+	uchar_t c;
+
+	if (custr_appendc(str, '#') != 0)
+		return (KMF_ERR_MEMORY);
+
+	for (i = 0; i < data->Length; i++) {
+		c = data->Data[i];
+		if (custr_appendc(str, hexdigits[(c >> 4) & 0xf]) != 0 ||
+		    custr_appendc(str, hexdigits[(c & 0xf)]) != 0) {
+			return (KMF_ERR_MEMORY);
+		}
+	}
+
+	return (KMF_OK);
+}
+
 /*
- * Convert an RDN value into a printable name with appropriate escaping
+ * Convert an RDN value into a printable name with appropriate escaping.
+ * The rules are taken from RFC4514.  While it is dealing with LDAP
+ * distinguished names, both LDAP and x509 certificates are based on the
+ * same underlying ITU standards, and as far as I can determine, the same
+ * rules apply (or at least the rules for LDAP DNs apply the same to x509
+ * DNs).
  */
 static KMF_RETURN
 value_to_string(KMF_DATA *data, custr_t *str)
@@ -559,11 +586,12 @@ value_to_string(KMF_DATA *data, custr_t *str)
 		 * string representation (e.g. attribute names are case
 		 * insensitive, so 'CN=foo' and 'cn=foo' convert to the same
 		 * binary representation, but there is nothing to say if
-		 * either string form is preferred), so this shouldn't
+		 * either string form is canonical), so this shouldn't
 		 * pose a problem.
 		 */
 		if (c < ' ' || c >= 0x7f) {
-			if (custr_append_printf(str, "\\x%02hhx", c) != 0)
+			/* Unlike C, the escaped hex form is just \{hex}{hex} */
+			if (custr_append_printf(str, "\\%02hhx", c) != 0)
 				return (KMF_ERR_MEMORY);
 			continue;
 		}
@@ -573,12 +601,12 @@ value_to_string(KMF_DATA *data, custr_t *str)
 			/* Escape # if at the start of a value */
 			if (i != 0)
 				break;
-			/*FALLTHRU*/
+			/*FALLTHROUGH*/
 		case ' ':
 			/* Escape ' ' if at the start or end of a value */
 			if (i != 0 && i + 1 != data->Length)
 				break;
-			/*FALLTHRU*/
+			/*FALLTHROUGH*/
 		case '"':
 		case '+':
 		case ',':
@@ -635,7 +663,27 @@ ava_to_string(KMF_X509_TYPE_VALUE_PAIR *tvp, custr_t *str)
 		ret = KMF_ERR_MEMORY;
 		goto done;
 	}
-	ret = value_to_string(&tvp->value, str);
+
+	/*
+	 * RFC4514 indicates that an oid=value pair should have the value
+	 * printed as #xxxxxx.  In addition, we also print as a binary
+	 * value if the BER tag does not indicate the value is some sort
+	 * of printable string.
+	 */
+	switch (tvp->valueType) {
+	case BER_UTF8_STRING:
+	case BER_PRINTABLE_STRING:
+	case BER_T61STRING:
+	case BER_IA5STRING:
+		if (found) {
+			ret = value_to_string(&tvp->value, str);
+			break;
+		}
+		/*FALLTHROUGH*/
+	default:
+		ret = binvalue_to_string(&tvp->value, str);
+		break;
+	}
 
 done:
 	if (!found)
