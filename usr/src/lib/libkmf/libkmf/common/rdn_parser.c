@@ -590,8 +590,13 @@ value_to_string(KMF_DATA *data, custr_t *str)
 		 * pose a problem.
 		 */
 		if (c < ' ' || c >= 0x7f) {
-			/* Unlike C, the escaped hex form is just \{hex}{hex} */
-			if (custr_append_printf(str, "\\%02hhx", c) != 0)
+			/*
+			 * RFC4514 claims the hex form in a DN string is
+			 * \{hex}{hex}, however OpenSSL appears to use the
+			 * C style \x{hex}{hex}.  Given how near ubiquitous
+			 * OpenSSL is, we'll adopt their approach.
+			 */
+			if (custr_append_printf(str, "\\x%02hhx", c) != 0)
 				return (KMF_ERR_MEMORY);
 			continue;
 		}
@@ -601,12 +606,12 @@ value_to_string(KMF_DATA *data, custr_t *str)
 			/* Escape # if at the start of a value */
 			if (i != 0)
 				break;
-			/*FALLTHROUGH*/
+			/* FALLTHROUGH */
 		case ' ':
 			/* Escape ' ' if at the start or end of a value */
 			if (i != 0 && i + 1 != data->Length)
 				break;
-			/*FALLTHROUGH*/
+			/* FALLTHROUGH */
 		case '"':
 		case '+':
 		case ',':
