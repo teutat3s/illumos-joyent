@@ -55,6 +55,8 @@ if [[ $subcommand == pre && $cmd == 1 ]]; then
 	setup_platform_log
 fi
 
+jst_ufpromisc="yes"
+
 #
 # Now, carry on with all of the common statechange work.
 #

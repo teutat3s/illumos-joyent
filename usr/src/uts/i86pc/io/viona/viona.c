@@ -227,6 +227,7 @@
 #include <sys/mac_client.h>
 #include <sys/mac_provider.h>
 #include <sys/mac_client_priv.h>
+#include <sys/mac_impl.h>
 #include <sys/vlan.h>
 #include <inet/ip.h>
 
@@ -434,6 +435,7 @@ struct viona_link {
 	datalink_id_t		l_linkid;
 	mac_handle_t		l_mh;
 	mac_client_handle_t	l_mch;
+	mac_promisc_handle_t	l_mph;
 
 	pollhead_t		l_pollhead;
 };
@@ -1316,12 +1318,38 @@ static void
 viona_worker_rx(viona_vring_t *ring, viona_link_t *link)
 {
 	proc_t *p = ttoproc(curthread);
+	boolean_t promisc = B_FALSE;
 
 	ASSERT(MUTEX_HELD(&ring->vr_lock));
 	ASSERT3U(ring->vr_state, ==, VRS_RUN);
 
 	atomic_or_16(ring->vr_used_flags, VRING_USED_F_NO_NOTIFY);
-	mac_rx_set(link->l_mch, viona_rx, link);
+
+	/*
+	 * If this VNIC has been configured in unfiltered promiscuous mode, try
+	 * to set up a promisc callback.  This enables guests that need to use
+	 * addresses other than the primary address to see all traffic.
+	 *
+	 * The callback will be configured to fix up any missing frame
+	 * checksums, to strip VLAN headers, and to receive only inbound
+	 * traffic.  It will thus be analogous to the regular callback passed
+	 * to mac_rx_set(), except with a less constrained view of incoming
+	 * traffic.
+	 */
+	if (!mac_get_promisc_filtered(link->l_mch)) {
+		uint16_t flags = MAC_PROMISC_FLAGS_DO_FIXUPS |
+		    MAC_PROMISC_FLAGS_NO_TX_LOOP |
+		    MAC_PROMISC_FLAGS_VLAN_TAG_STRIP;
+
+		if (mac_promisc_add(link->l_mch, MAC_CLIENT_PROMISC_ALL,
+		    viona_rx, link, &link->l_mph, flags) == 0) {
+			promisc = B_TRUE;
+		}
+	}
+
+	if (!promisc) {
+		mac_rx_set(link->l_mch, viona_rx, link);
+	}
 
 	do {
 		/*
@@ -1341,7 +1369,11 @@ viona_worker_rx(viona_vring_t *ring, viona_link_t *link)
 	 * acquire vr_lock for tasks such as delivering an interrupt.  In order
 	 * to avoid such deadlocks, vr_lock must temporarily be dropped here.
 	 */
-	mac_rx_clear(link->l_mch);
+	if (promisc) {
+		mac_promisc_remove(link->l_mph);
+	} else {
+		mac_rx_clear(link->l_mch);
+	}
 	mutex_enter(&ring->vr_lock);
 }
 
