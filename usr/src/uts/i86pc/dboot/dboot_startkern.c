@@ -2312,6 +2312,7 @@ dboot_loader_init(void)
 #if defined(_BOOT_TARGET_amd64)
 		load_addr = mb2_load_addr;
 #endif
+		dboot_printf("started with MB2\n");
 		break;
 
 	default:

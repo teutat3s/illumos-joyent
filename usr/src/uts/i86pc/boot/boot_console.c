@@ -70,7 +70,7 @@ fb_info_t fb_info;
 static bcons_dev_t bcons_dev;				/* Device callbacks */
 static int console = CONS_SCREEN_TEXT;
 static int diag = CONS_INVALID;
-static int tty_num = 0;
+static int tty_num = 1;
 static int tty_addr[] = {0x3f8, 0x2f8, 0x3e8, 0x2e8};
 static char *boot_line;
 static struct boot_env {
